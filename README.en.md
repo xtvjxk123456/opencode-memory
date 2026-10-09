@@ -6,11 +6,13 @@ This extension gives your AI assistant the ability to remember your preferences,
 
 [中文文档](./README.md)
 
+> **Version note**: `2.0.0` and later target the **OpenCode 2** plugin API (the `1.0.x` line only supports OpenCode 1.x). Both lines share the same SQLite database, so upgrading keeps all memories.
+
 ## Features
 
 - **Persistent Storage** — Uses SQLite to store memories, ensuring they persist across different OpenCode sessions.
-- **5 Built-in Tools** — The AI can search, store, and delete memories automatically or on command.
-- **Auto-Injection** — Automatically injects relevant memories into the context at the start of every new session.
+- **4 Built-in Tools** — The AI can search, store, and delete memories automatically or on command.
+- **Auto-Injection** — Injects existing memories into the system prompt on every model request (subagent sessions are skipped to keep their context pure; injection survives compaction).
 - **Smart Categorization** — Memories are grouped into preferences (`pref.*`), environment (`env.*`), tools (`tool.*`), and user (`user.*`).
 - **Project Scoping** — Any preference can be global (applies everywhere) or scoped exclusively to the current project.
 - **Intelligent Project Detection** — Uses git remote URLs to identify projects, automatically sharing memory across multiple clones of the same repository.
@@ -18,7 +20,7 @@ This extension gives your AI assistant the ability to remember your preferences,
 - **Full-Text Search** — Powered by FTS5 full-text search (with graceful fallback to fuzzy matching).
 - **Zero Configuration** — No need to configure external models or API keys; it runs seamlessly using OpenCode's native environment.
 - **Optimized Prompts** — Carefully tuned system prompts and injection mechanisms ensure the AI effectively utilizes the memory without degrading conversational quality.
-- **Visual Feedback** — Provides an unobtrusive Toast notification upon successful memory injection, so you always know when your context is ready.
+- **Native OpenCode 2** — Built on the V2 plugin protocol (`ctx.tool.transform` for tools, `session.context` hook for injection); plugin code hot-reloads on save.
 - **Real-time Hot Updates** — Memories taught to the AI mid-conversation take effect instantly on the very next message without needing to restart or reload the window!
 
 ## Screenshots
@@ -28,14 +30,37 @@ This extension gives your AI assistant the ability to remember your preferences,
 
 ## Installation
 
-This plugin is available on npm and does not require a separate Bun installation (OpenCode has Bun built-in).
+### OpenCode 2 (2.0.0+, this repository)
 
-1. Install the package:
+This repository is the local plugin directory; no npm publish is needed:
+
+1. Install the plugin dependencies:
+
+```bash
+cd C:/code/supereasy-memory
+npm install
+```
+
+2. Register the plugin directory in the `plugins` array of `opencode.json` (global or project config):
+
+```json
+{
+  "plugins": [
+    "file:///C:/code/supereasy-memory"
+  ]
+}
+```
+
+3. Restart or reload OpenCode. Afterwards, edits to the plugin code are hot-reloaded by OpenCode 2 automatically.
+
+### OpenCode 1.x (legacy)
+
+Use the published `1.0.x` package (V1 plugin API):
+
 ```bash
 npm install -g supereasy-memory
 ```
 
-2. Open your `opencode.json` configuration file and add the package name to the `plugin` array:
 ```json
 {
   "plugin": [
@@ -43,8 +68,6 @@ npm install -g supereasy-memory
   ]
 }
 ```
-
-3. Restart or reload OpenCode for the changes to take effect.
 
 ## Available Tools
 
@@ -91,7 +114,7 @@ Every memory fact has a scope:
 
 Database is safely stored within OpenCode's configuration directory: `~/.config/opencode/supereasy-memory/supereasy-memory.db`
 
-Uses SQLite in WAL mode to support concurrent reads.
+Uses SQLite in WAL mode to support concurrent reads. The V1 → V2 upgrade reuses the same database file, so existing memories are preserved.
 
 ## License
 
@@ -100,5 +123,3 @@ This project is licensed under the [MIT License](LICENSE).
 ## Acknowledgements
 
 This plugin is a port of [samfoy/pi-memory](https://pi.dev/packages/@samfp/pi-memory?name=memory). Special thanks to the original author for the incredible design and logic.
-
-

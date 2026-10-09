@@ -16,7 +16,7 @@ This is a Bun-based TypeScript project.
 The database uses `bun:sqlite` with local SQLite storage.
 
 ### Core Files
-- `index.ts`: The main plugin entry point. It exports the `Plugin` function containing all the Tool definitions (`memory_remember`, `memory_search`, etc.) and the OpenCode lifecycle hooks (`experimental.chat.messages.transform` and `experimental.session.compacting`).
+- `index.ts`: The main plugin entry point. It exports a V2 plugin definition (`{ id, setup }`) containing all the Tool definitions (`memory_remember`, `memory_search`, etc.) and the session hook (`ctx.session.hook("context")`, which injects memory into the system prompt on every model request).
 - `store.ts`: The SQLite data access layer. It handles migrations, FTS5 full-text search, and the Jaccard similarity algorithm for deduplicating lessons.
 - `injector.ts`: The context injection layer. It reads memories from the store and formats them into an 8KB-limited XML block (`<persistent_memory>`) with dynamic grouping based on key prefixes.
 - `test.ts`: The primary test suite.
@@ -30,7 +30,7 @@ The database uses `bun:sqlite` with local SQLite storage.
 2. **Database Schema Changes**: If you modify the SQLite schema in `store.ts`, remember that SQLite in Bun handles synchronous execution. Be careful with migrations as `bun:sqlite` does not support complex async migration flows out of the box.
 3. **Context Injection Safety**: 
    - If you modify `injector.ts`, ensure that the output XML strictly adheres to the `MAX_CONTEXT_CHARS` (8000) limit. Failing to do so will cause the LLM context window to overflow and break the user's OpenCode session.
-   - The injection in `experimental.chat.messages.transform` must only apply to the main agent. It automatically identifies subagents by checking if the session has a `parentID` via the OpenCode SDK, and skips memory injection for them to keep their context pure.
+   - The injection in `ctx.session.hook("context")` must only apply to the main agent. It automatically identifies subagents by checking if the session has a `parentID` via `ctx.session.get`, and skips memory injection for them to keep their context pure.
 4. **Testing**: 
    - After making changes, ALWAYS run the test suite: `bun test test.ts`.
    - Ensure you haven't broken the FTS5 search or Jaccard similarity threshold tests.
@@ -51,7 +51,7 @@ The user develops in this directory (`e:\project\openc`), but the plugin is dist
 ---
 
 ## 🧠 Using the Plugin (from the AI's perspective)
-When the user installs this plugin, they gain 5 tools:
+When the user installs this plugin, they gain 4 tools:
 - `memory_remember`: Upserts facts or records lessons.
 - `memory_search`: Full-text search across facts and lessons.
 - `memory_stats`: Retrieves DB metrics.

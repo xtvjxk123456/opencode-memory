@@ -6,11 +6,13 @@ OpenCode 的持久化记忆插件。移植自优秀的 [pi-memory](https://pi.de
 
 [English Documentation](./README.en.md)
 
+> **版本说明**：`2.0.0` 起基于 **OpenCode 2** 插件 API（V1 的 `1.0.x` 仅支持 OpenCode 1.x）。V1 → V2 沿用同一个 SQLite 数据库，升级不丢记忆。
+
 ## 功能
 
 - **持久化存储** — 使用 SQLite 存储记忆，跨会话持久化
-- **5 个工具** — AI 可以搜索、存储、删除记忆
-- **自动注入** — 每次主会话自动将已有记忆注入到上下文（自动跳过 Subagent 以保持其纯粹性）
+- **4 个工具** — AI 可以搜索、存储、删除记忆
+- **自动注入** — 每次模型请求自动将已有记忆注入 system 提示词（自动跳过 Subagent 以保持其纯粹性；压缩后依然有效）
 - **分类管理** — 偏好 (`pref.*`)、环境 (`env.*`)、工具 (`tool.*`)、用户 (`user.*`)
 - **项目作用域** — 任何偏好都可以设定为全局或仅对当前项目生效
 - **智能项目识别** — 优先使用 git remote URL 识别项目，同仓库多份拷贝自动共享记忆
@@ -18,7 +20,7 @@ OpenCode 的持久化记忆插件。移植自优秀的 [pi-memory](https://pi.de
 - **全文搜索** — FTS5 全文搜索（不支持时自动降级为模糊搜索）
 - **零额外配置** — 彻底开箱即用，无需额外配置任何模型或 API 密钥，直接复用 OpenCode 的底层原生能力。
 - **极致的提示词优化** — 经过精心调优的注入机制与 Prompt 优化，确保 AI 既能准确命中记忆，又不会消耗多余的上下文。
-- **可视化注入反馈** — 成功注入记忆后会触发优雅的 Toast 气泡提示，让您清晰地感知到记忆上下文已准备就绪。
+- **OpenCode 2 原生** — 基于 V2 插件协议（`ctx.tool.transform` 注册工具、`session.context` hook 注入），保存插件代码后自动热重载。
 - **实时热更新生效** — 对话中告诉 AI 记住的信息，在同一窗口的下一条消息中立刻生效，无需重启或刷新窗口！
 
 ## 截图预览
@@ -28,14 +30,37 @@ OpenCode 的持久化记忆插件。移植自优秀的 [pi-memory](https://pi.de
 
 ## 安装
 
-本插件已发布至 npm，且无需额外安装 Bun 环境（OpenCode 内部已内置运行环境）。
+### OpenCode 2（2.0.0+，本仓库）
 
-1. 全局安装 npm 包：
+本仓库即本地插件目录，无需发布 npm：
+
+1. 安装插件依赖：
+
+```bash
+cd C:/code/supereasy-memory
+npm install
+```
+
+2. 在 `opencode.json`（全局或项目配置）的 `plugins` 数组中登记插件目录：
+
+```json
+{
+  "plugins": [
+    "file:///C:/code/supereasy-memory"
+  ]
+}
+```
+
+3. 重启或重载 OpenCode 即可生效；之后修改插件代码会被 OpenCode 2 自动热重载。
+
+### OpenCode 1.x（旧版）
+
+使用 npm 上发布的 `1.0.x`（V1 插件 API）：
+
 ```bash
 npm install -g supereasy-memory
 ```
 
-2. 打开您的 `opencode.json` 配置文件，将包名直接添加到 `plugin` 数组中：
 ```json
 {
   "plugin": [
@@ -43,8 +68,6 @@ npm install -g supereasy-memory
   ]
 }
 ```
-
-3. 重启或重载 OpenCode 即可生效。
 
 ## 工具
 
@@ -117,7 +140,7 @@ AI 保存后会告知你选择的作用域，你可以随时要求修改：
 
 数据库安全地统一存储在 OpenCode 的配置目录中：`~/.config/opencode/supereasy-memory/supereasy-memory.db`
 
-使用 SQLite WAL 模式，支持并发读取。
+使用 SQLite WAL 模式，支持并发读取。V1 → V2 升级沿用同一个数据库文件，已有记忆不受影响。
 
 ## 开源协议
 
@@ -126,5 +149,3 @@ AI 保存后会告知你选择的作用域，你可以随时要求修改：
 ## 致谢
 
 本插件深度移植自 [samfoy/pi-memory](https://pi.dev/packages/@samfp/pi-memory?name=memory)，非常感谢原作者卓越的设计与逻辑。
-
-
