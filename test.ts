@@ -247,6 +247,32 @@ if (cjk3 !== null) {
 }
 console.log("   ✓ 不同的中文教训可入库，近似的中文教训被拦截\n");
 
+// 测试 17: 中文关键词检索（FTS5 的 unicode61 不切分汉字，必须走 LIKE 兜底）
+console.log("17. 测试中文关键词检索...");
+store.upsertSemantic("pref.语言", "中文优先，注释用中文", 0.9, "user");
+const cnLessons = store.searchLessons("部署", 5);
+const cnSingle = store.searchLessons("部", 5);
+const cnFacts = store.searchSemantic("中文", 5);
+const enStillOk = store.searchSemantic("commit", 5);
+console.log(`   "部署" → ${cnLessons.length} 条教训, "部" → ${cnSingle.length} 条, "中文" → ${cnFacts.length} 条事实`);
+if (cnLessons.length === 0) {
+  console.error("   ✗ 中文关键词检索 0 命中（CJK 应走 LIKE 兜底）！");
+  process.exit(1);
+}
+if (cnSingle.length === 0) {
+  console.error("   ✗ 单个汉字也应能命中！");
+  process.exit(1);
+}
+if (cnFacts.length === 0) {
+  console.error("   ✗ 中文事实检索 0 命中！");
+  process.exit(1);
+}
+if (enStillOk.length === 0) {
+  console.error("   ✗ 英文检索被破坏了！");
+  process.exit(1);
+}
+console.log("   ✓ 中文（含单字）走 LIKE 命中，英文仍走 FTS 正常\n");
+
 // 测试完毕，清理测试数据库
 store.close();
 try {

@@ -20,7 +20,7 @@ This extension gives your AI assistant the ability to remember your preferences,
 - **Project Scoping** — Any preference can be global (applies everywhere) or scoped exclusively to the current project.
 - **Intelligent Project Detection** — Uses git remote URLs to identify projects, automatically sharing memory across multiple clones of the same repository.
 - **Lessons Learned** — Manages corrections and lessons separately, using Jaccard similarity deduplication to prevent redundant rules.
-- **Full-Text Search** — Powered by FTS5 full-text search (with graceful fallback to fuzzy matching).
+- **Full-Text Search** — Powered by FTS5 full-text search (with graceful fallback to fuzzy matching); queries containing Chinese/Japanese/Korean text use substring matching instead, since FTS5's `unicode61` tokenizer does not split CJK runs.
 - **Zero Configuration** — No need to configure external models or API keys; it runs seamlessly using OpenCode's native environment.
 - **Optimized Prompts** — Carefully tuned system prompts and injection mechanisms ensure the AI effectively utilizes the memory without degrading conversational quality.
 - **Native OpenCode 2** — Built on the V2 plugin protocol (`ctx.tool.transform` for tools, `session.context` hook for injection); plugin code hot-reloads on save.

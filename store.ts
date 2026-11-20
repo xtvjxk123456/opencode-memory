@@ -128,6 +128,15 @@ function jaccardSimilarity(a: string, b: string): number {
   return union === 0 ? 0 : intersection / union;
 }
 
+/**
+ * 查询里是否含 CJK。含 CJK 时检索必须绕开 FTS：
+ * FTS5 的 unicode61 把连续汉字整段当成一个 token（"部署前先预览" 是一个 token），
+ * `MATCH '"部署"'` 因此对中文必然 0 命中。LIKE 子串匹配对中文有效，
+ * 且对英文/ASCII 的命中结果与 FTS 一致（实测逐词对比无差异）。
+ */
+const HAS_CJK =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+
 // ─── 数据库存储类 (Store) ───────────────────────────────────────────────────────────
 
 export class MemoryStore {
@@ -243,7 +252,7 @@ export class MemoryStore {
   // ─── 事实记忆 (Semantic Memory) 操作 ─────────────────────────────────────────────
 
   /**
-   * 搜索事实记忆，优先使用 FTS5 引擎，失败则降级使用 LIKE 匹配。
+   * 搜索事实记忆，优先使用 FTS5 引擎；查询含 CJK 或 FTS5 不可用时走 LIKE 子串匹配。
    *
    * @param query 搜索关键词
    * @param limit 返回的最大条数 (默认 15)
@@ -252,7 +261,8 @@ export class MemoryStore {
   searchSemantic(query: string, limit: number = 15): SemanticEntry[] {
     if (!query.trim()) return [];
 
-    if (this.hasFTS5) {
+    // 含中文等 CJK 的查询绕开 FTS（unicode61 无法切分，MATCH 必然 0 命中）
+    if (this.hasFTS5 && !HAS_CJK.test(query)) {
       try {
         // 针对 FTS5 引擎净化查询字符串 — 移除特殊字符并使用 OR 连接多个单词
         const sanitized = query
@@ -656,7 +666,7 @@ export class MemoryStore {
   }
 
   /**
-   * 搜索经验教训，优先使用 FTS5 引擎，如果环境不支持则降级使用 LIKE 匹配。
+   * 搜索经验教训，优先使用 FTS5 引擎；查询含 CJK 或 FTS5 不可用时走 LIKE 子串匹配。
    *
    * @param query 搜索关键词
    * @param limit 最大返回条数 (默认 15)
@@ -667,7 +677,8 @@ export class MemoryStore {
 
     let rows: Array<Omit<LessonEntry, "negative"> & { negative: number }>;
 
-    if (this.hasFTS5) {
+    // 含中文等 CJK 的查询绕开 FTS（unicode61 无法切分，MATCH 必然 0 命中）
+    if (this.hasFTS5 && !HAS_CJK.test(query)) {
       try {
         const sanitized = query
           .replace(/['"]/g, "")

@@ -50,8 +50,19 @@ function loadInjectionConfig(): InjectionConfig {
 
 // ─── 数据库单例 ─────────────────────────────────────────────────
 // 挂在 globalThis 上，插件热重载（reload）时复用同一个连接，避免连接泄漏。
+// 但缓存必须能识别「模块已换版本」：否则 store.ts 改了、热重载生效了，
+// 拿到的仍是旧模块里的类实例，方法还是老逻辑（实测表现为“改了没反应”）。
 
 const STORE_KEY = Symbol.for("supereasy-memory.store");
+
+/** 每次模块加载都会产生一个新对象，热重载后与旧模块的 token 必然不同 */
+const MODULE_TOKEN = {};
+
+/** globalThis 上缓存的槽位：模块 token + 实例 */
+interface StoreSlot {
+  token: unknown;
+  store: MemoryStore;
+}
 
 /**
  * 获取或初始化全局的 MemoryStore 数据库实例。
@@ -59,16 +70,17 @@ const STORE_KEY = Symbol.for("supereasy-memory.store");
  * ~/.config/opencode/supereasy-memory/supereasy-memory.db
  */
 function getStore(): MemoryStore {
-  const g = globalThis as unknown as Record<PropertyKey, MemoryStore>;
-  let s = g[STORE_KEY];
-  if (!s) {
-    if (!existsSync(CONFIG_DIR)) {
-      mkdirSync(CONFIG_DIR, { recursive: true });
-    }
-    s = new MemoryStore(join(CONFIG_DIR, "supereasy-memory.db"));
-    g[STORE_KEY] = s;
+  const g = globalThis as unknown as Record<PropertyKey, unknown>;
+  const slot = g[STORE_KEY] as StoreSlot | undefined;
+  if (slot && slot.token === MODULE_TOKEN) return slot.store;
+
+  if (!existsSync(CONFIG_DIR)) {
+    mkdirSync(CONFIG_DIR, { recursive: true });
   }
-  return s;
+  // 旧实例不主动 close：同一进程可能有多个会话共用它，交给 GC 回收
+  const store = new MemoryStore(join(CONFIG_DIR, "supereasy-memory.db"));
+  g[STORE_KEY] = { token: MODULE_TOKEN, store } satisfies StoreSlot;
+  return store;
 }
 
 /**
