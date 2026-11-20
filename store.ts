@@ -82,7 +82,34 @@ export interface MemoryStats {
 // ─── 杰卡德相似度 (Jaccard Similarity) 算法 ──────────────────────────────────────────────
 
 /**
- * 使用基于词级别的 Token 拆分来计算两个字符串的 Jaccard 相似度。
+ * 把文本拆成用于相似度比较的 token 集合。
+ *
+ * - 拉丁字母/数字按词切分。
+ * - CJK 没有空格，按「二元组」切分（部署前 → 部署/署前…），单字成串时保留单字。
+ *   注意不能用 `\w` 过滤后按空格切：`\w` 不含中文，纯中文句会变成空集，
+ *   导致任意两条中文教训都被判成完全重复而拒收。
+ */
+function tokenizeForSimilarity(s: string): Set<string> {
+  const lower = s.toLowerCase();
+  const tokens = new Set<string>();
+  for (const m of lower.matchAll(/[a-z0-9_]+/g)) {
+    tokens.add(m[0]);
+  }
+  for (const m of lower.matchAll(/\p{Script=Han}+/gu)) {
+    const run = m[0];
+    if (run.length === 1) {
+      tokens.add(run);
+      continue;
+    }
+    for (let i = 0; i < run.length - 1; i++) {
+      tokens.add(run.slice(i, i + 2));
+    }
+  }
+  return tokens;
+}
+
+/**
+ * 计算两个字符串的 Token 级 Jaccard 相似度。
  * 主要用于经验教训的去重拦截 — 如果相似度 >= 0.7，我们就会认为这是一条重复的教训。
  *
  * @param a 第一个需要比较的字符串
@@ -90,16 +117,8 @@ export interface MemoryStats {
  * @returns {number} 相似度得分 (0.0 到 1.0)
  */
 function jaccardSimilarity(a: string, b: string): number {
-  const tokenize = (s: string) =>
-    new Set(
-      s
-        .toLowerCase()
-        .replace(/[^\w\s]/g, "")
-        .split(/\s+/)
-        .filter(Boolean),
-    );
-  const setA = tokenize(a);
-  const setB = tokenize(b);
+  const setA = tokenizeForSimilarity(a);
+  const setB = tokenizeForSimilarity(b);
   if (setA.size === 0 && setB.size === 0) return 1;
   let intersection = 0;
   for (const token of setA) {

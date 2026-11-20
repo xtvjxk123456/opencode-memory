@@ -232,6 +232,21 @@ if (tightBlock.stats.lessons === 0) {
 }
 console.log("   ✓ 自定义上限生效\n");
 
+// 测试 16: 中文教训去重（分词不能因为过滤掉中文而变成空集）
+console.log("16. 测试中文教训去重...");
+const cjk1 = store.addLesson("部署前先让我预览再发布", "deployment", false, "user");
+const cjk2 = store.addLesson("写中文文档前先确认目标读者", "writing", false, "user");
+const cjk3 = store.addLesson("部署前先让我预览再发布内容", "deployment", false, "user");
+if (!cjk1 || !cjk2) {
+  console.error("   ✗ 两条不同的中文教训都应该被接受（纯中文被误判为重复）！");
+  process.exit(1);
+}
+if (cjk3 !== null) {
+  console.error("   ✗ 高度相似的中文教训应该被拦截！");
+  process.exit(1);
+}
+console.log("   ✓ 不同的中文教训可入库，近似的中文教训被拦截\n");
+
 // 测试完毕，清理测试数据库
 store.close();
 try {
