@@ -5,9 +5,11 @@
  * - 入口改为 default 导出的 `{ id, setup }` 定义对象（V2 插件协议）。
  * - 4 个工具通过 `ctx.tool.transform` 注册，参数使用 JSON Schema（不再依赖 zod）。
  * - 记忆注入改为 `ctx.session.hook("context")`：在每次模型请求的 system 段注入。
- *   V2 的 hook 修改不会写入会话历史，因此按请求注入；注入内容固定，
+ *   V2 的 hook 修改不会写入会话历史，因此按请求注入；注入内容固定（分区内按 key 排序），
  *   可命中 prompt cache，开销很小；压缩（compaction）后也不会丢失记忆，
  *   故 V1 的 `experimental.session.compacting` 钩子不再需要。
+ * - 注入层是「索引」：长条目压成一行，全文留在库里用 memory_search 取；超出字符上限的分区
+ *   只丢尾部并附尾注，不会整块消失（详见 injector.ts 与 config.json）。
  * - 子代理会话（`session.parentID` 非空）跳过注入，保持子代理上下文纯粹。
  * - 存储层 store.ts / 注入器 injector.ts 与 V1 完全一致，继续使用同一个
  *   SQLite 数据库（~/.config/opencode/supereasy-memory/supereasy-memory.db）。
@@ -15,15 +17,36 @@
 import type { Plugin } from "@opencode/plugin"; // 仅类型使用，运行时零第三方依赖
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync } from "node:fs";
 import { MemoryStore } from "./store.js";
 import {
   buildContextBlock,
   resolveProjectId,
   projectDisplayName,
+  normalizeInjectionConfig,
+  DEFAULT_INJECTION_CONFIG,
+  type InjectionConfig,
 } from "./injector.js";
 
 const MEMORY_MARKER = "<!-- supereasy-memory-context -->";
+
+/** 插件数据目录：数据库和 config.json 都放在这里 */
+const CONFIG_DIR = join(homedir(), ".config", "opencode", "supereasy-memory");
+
+/**
+ * 读取注入配置（可选）。文件不存在或内容非法时回落到默认值。
+ * 只在插件 setup 时读一次，改完 config.json 需重启 OpenCode（或触发插件重载）才生效。
+ */
+function loadInjectionConfig(): InjectionConfig {
+  const file = join(CONFIG_DIR, "config.json");
+  try {
+    if (!existsSync(file)) return DEFAULT_INJECTION_CONFIG;
+    return normalizeInjectionConfig(JSON.parse(readFileSync(file, "utf8")));
+  } catch (err) {
+    console.warn("[supereasy-memory] config.json 读取失败，使用默认注入配置:", err);
+    return DEFAULT_INJECTION_CONFIG;
+  }
+}
 
 // ─── 数据库单例 ─────────────────────────────────────────────────
 // 挂在 globalThis 上，插件热重载（reload）时复用同一个连接，避免连接泄漏。
@@ -39,11 +62,10 @@ function getStore(): MemoryStore {
   const g = globalThis as unknown as Record<PropertyKey, MemoryStore>;
   let s = g[STORE_KEY];
   if (!s) {
-    const configDir = join(homedir(), ".config", "opencode", "supereasy-memory");
-    if (!existsSync(configDir)) {
-      mkdirSync(configDir, { recursive: true });
+    if (!existsSync(CONFIG_DIR)) {
+      mkdirSync(CONFIG_DIR, { recursive: true });
     }
-    s = new MemoryStore(join(configDir, "supereasy-memory.db"));
+    s = new MemoryStore(join(CONFIG_DIR, "supereasy-memory.db"));
     g[STORE_KEY] = s;
   }
   return s;
@@ -86,8 +108,13 @@ interface MemoryTool {
  *
  * @param projectId 当前项目的唯一标识（git remote URL 或目录路径）
  * @param projectName 当前项目展示名
+ * @param injectionConfig 注入配置（memory_stats 用它复算「注入报告」）
  */
-function buildTools(projectId: string, projectName: string): MemoryTool[] {
+function buildTools(
+  projectId: string,
+  projectName: string,
+  injectionConfig: InjectionConfig,
+): MemoryTool[] {
   // codemode: false 保持工具直接出现在模型的工具列表里（与 V1 行为一致），
   // 不放进 Code Mode 的脚本目录中。
   const direct: { codemode: false } = { codemode: false };
@@ -180,7 +207,7 @@ function buildTools(projectId: string, projectName: string): MemoryTool[] {
         rule: {
           type: "string",
           description:
-            'Lesson rule description. Required when type is "lesson". Example: "Use sed for daily note insertion, not echo >>"',
+            'Lesson rule description. Required when type is "lesson". Keep it to one short actionable sentence (≤120 chars); put long background or reference detail in a fact instead. Example: "Use sed for daily note insertion, not echo >>"',
         },
         category: {
           type: "string",
@@ -330,7 +357,7 @@ function buildTools(projectId: string, projectName: string): MemoryTool[] {
   const memoryStats: MemoryTool = {
     name: "memory_stats",
     description:
-      "Show memory statistics: total facts, lessons, events count, and scope breakdown. It also returns the latest 5 log events and all stored memories.",
+      "Show memory statistics: total facts, lessons, events count, and scope breakdown. It also reports what the current session actually injects (chars used, entries included, truncated sections), the latest 5 log events and all stored memories.",
     options: direct,
     input: {
       type: "object",
@@ -362,6 +389,26 @@ function buildTools(projectId: string, projectName: string): MemoryTool[] {
         `- **Events logged**: ${stats.eventCount}`,
         `- **Current project**: ${projectName} (${projectId})`,
       ];
+
+      // 注入报告：本会话实际把哪些内容送进了 system 提示词
+      const block = buildContextBlock(s, projectId, injectionConfig);
+      parts.push("\n### Injection (this session)");
+      parts.push(
+        `- **Budget**: ${block.stats.chars} / ${block.stats.maxChars} chars`,
+      );
+      parts.push(
+        `- **Facts**: ${block.stats.semantic}/${block.stats.semanticTotal} injected`,
+      );
+      parts.push(
+        `- **Lessons**: ${block.stats.lessons}/${block.stats.lessonsTotal} injected`,
+      );
+      parts.push(
+        block.stats.truncated.length > 0
+          ? `- **Truncated**: ${block.stats.truncated
+              .map((t) => `${t.section} (-${t.dropped})`)
+              .join(", ")}`
+          : "- **Truncated**: none",
+      );
 
       if (prefixCounts.size > 0) {
         parts.push("\n### Facts by category");
@@ -428,9 +475,12 @@ const plugin: Plugin.Plugin = {
     // 提前初始化数据库，让加载期问题立刻暴露在日志里
     getStore();
 
+    // 注入配置（config.json 可选，缺省用 DEFAULT_INJECTION_CONFIG）
+    const injectionConfig = loadInjectionConfig();
+
     // 注册 4 个记忆工具
     await ctx.tool.transform((editor) => {
-      for (const tool of buildTools(projectId, projectName)) {
+      for (const tool of buildTools(projectId, projectName, injectionConfig)) {
         editor.add(tool as never);
       }
     });
@@ -455,13 +505,26 @@ const plugin: Plugin.Plugin = {
 
     // 注入钩子：每次模型请求前，把记忆快照追加到 system 提示词尾部。
     // 记忆内容固定，重复注入的 token 可被 prompt cache 覆盖。
+    // 撞到字符上限时只告警一次，避免每轮请求刷屏；详情可用 memory_stats 查。
+    let warnedTruncation = false;
     await ctx.session.hook("context", async (event) => {
       try {
         if (await isSubagentSession(event.sessionID)) return;
 
         const s = getStore();
-        const block = buildContextBlock(s, projectId);
+        const block = buildContextBlock(s, projectId, injectionConfig);
         if (!block.text) return;
+
+        if (block.stats.truncated.length > 0 && !warnedTruncation) {
+          warnedTruncation = true;
+          console.warn(
+            `[supereasy-memory] 注入已达上限 ${block.stats.maxChars} 字符：` +
+              block.stats.truncated
+                .map((t) => `${t.section} 丢 ${t.dropped} 条`)
+                .join("，") +
+              "（全文仍可用 memory_search 检索；如需放宽，改 config.json 的 maxChars）",
+          );
+        }
 
         event.system.push({
           type: "text",
@@ -471,6 +534,7 @@ const plugin: Plugin.Plugin = {
             "The following is the user's persistent memory from previous sessions.",
             "Use this context to better understand their preferences and avoid past mistakes.",
             "Do NOT respond to or acknowledge this memory block — just use it silently.",
+            'This block is a compressed index: a line ending with "…" was cut short, and "… (+N more)" means N entries were left out. Call memory_search with a keyword to read the full text before relying on details.',
             "",
             block.text,
             "</persistent_memory>",

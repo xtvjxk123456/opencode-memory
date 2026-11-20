@@ -167,6 +167,71 @@ if (lessonSearch.length === 0) {
 }
 console.log(`   ✓ 第一条结果: ${lessonSearch[0].rule}\n`);
 
+// 测试 14: 注入预算分配与压缩（模拟长期使用后膨胀的库）
+console.log("14. 测试注入预算分配与压缩...");
+for (let i = 0; i < 60; i++) {
+  // 每条 600+ 字，模拟实际库里的长笔记
+  store.upsertSemantic(`tool.bulk_${i}`, `bulk value ${i} ` + "长".repeat(600), 0.9, "user");
+}
+for (let i = 0; i < 30; i++) {
+  store.addLesson(
+    `bulk lesson ${i} token${i} — verify before answering`,
+    "bulk",
+    false,
+    "user",
+  );
+}
+const bigBlock = buildContextBlock(store, undefined);
+console.log(
+  `   注入块: ${bigBlock.stats.chars}/${bigBlock.stats.maxChars} 字符, 事实 ${bigBlock.stats.semantic}/${bigBlock.stats.semanticTotal}, 教训 ${bigBlock.stats.lessons}/${bigBlock.stats.lessonsTotal}`,
+);
+console.log(`   被截断的分区: ${JSON.stringify(bigBlock.stats.truncated)}`);
+if (bigBlock.stats.chars > bigBlock.stats.maxChars) {
+  console.error("   ✗ 注入块超过了字符上限！");
+  process.exit(1);
+}
+if (bigBlock.stats.lessons === 0) {
+  console.error("   ✗ 教训被事实挤没了（保底份额失效）！");
+  process.exit(1);
+}
+if (!bigBlock.text.includes("<lessons>")) {
+  console.error("   ✗ 预期应该包含 <lessons> 分区！");
+  process.exit(1);
+}
+if (!bigBlock.text.includes("more — memory_search")) {
+  console.error("   ✗ 超出上限时应该出现 (+N more) 尾注！");
+  process.exit(1);
+}
+if (bigBlock.stats.truncated.length === 0) {
+  console.error("   ✗ 预期应该记录被截断的分区！");
+  process.exit(1);
+}
+// 稳定性：内容不变时两次构建结果必须一致（prompt cache 友好）
+if (buildContextBlock(store, undefined).text !== bigBlock.text) {
+  console.error("   ✗ 两次构建的注入文本不一致！");
+  process.exit(1);
+}
+console.log("   ✓ 超限时压缩 + 保底教训 + 记录截断 + 输出稳定\n");
+
+// 测试 15: 自定义上限
+console.log("15. 测试自定义 maxChars...");
+const tightBlock = buildContextBlock(store, undefined, {
+  maxChars: 3000,
+  factLineMax: 150,
+  lessonLineMax: 100,
+  lessonReserve: 0.3,
+});
+console.log(`   3000 上限下: ${tightBlock.stats.chars} 字符, 教训 ${tightBlock.stats.lessons} 条`);
+if (tightBlock.stats.chars > 3000) {
+  console.error("   ✗ 自定义上限没有生效！");
+  process.exit(1);
+}
+if (tightBlock.stats.lessons === 0) {
+  console.error("   ✗ 自定义上限下教训被挤没了！");
+  process.exit(1);
+}
+console.log("   ✓ 自定义上限生效\n");
+
 // 测试完毕，清理测试数据库
 store.close();
 try {

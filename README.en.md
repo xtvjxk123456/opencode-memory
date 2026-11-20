@@ -15,6 +15,7 @@ This extension gives your AI assistant the ability to remember your preferences,
 - **Persistent Storage** — Uses SQLite to store memories, ensuring they persist across different OpenCode sessions.
 - **4 Built-in Tools** — The AI can search, store, and delete memories automatically or on command.
 - **Auto-Injection** — Injects existing memories into the system prompt on every model request (subagent sessions are skipped to keep their context pure; injection survives compaction).
+- **Indexed Injection** — Long entries collapse to one line and the full text stays in the database for on-demand search; when the budget is exceeded only the tail is dropped, marked with `(+N more)` instead of vanishing whole.
 - **Smart Categorization** — Memories are grouped into preferences (`pref.*`), environment (`env.*`), tools (`tool.*`), and user (`user.*`).
 - **Project Scoping** — Any preference can be global (applies everywhere) or scoped exclusively to the current project.
 - **Intelligent Project Detection** — Uses git remote URLs to identify projects, automatically sharing memory across multiple clones of the same repository.
@@ -111,6 +112,31 @@ Every memory fact has a scope:
 2. Falls back to the full directory path if git is not available.
 
 *Note: If the same key exists in both Global and Project scopes, the Project scope takes precedence.*
+
+## Injection Strategy
+
+Before every model request the plugin appends a `<memory>` block to the end of the system prompt. The injected block is an **index**, not the full text:
+
+- **One line per long entry** — a fact value over 150 characters, or a lesson over 100 characters (first sentence), is truncated and ends with `…`; the full text stays in the database and the model fetches it with `memory_search`. The block itself explains this.
+- **Nothing is dropped whole** — the block has a character budget (8000 by default). A section that does not fit loses only its tail and gets a `… (+N more — memory_search)` trailer, so `<lessons>` can no longer silently disappear.
+- **Lessons keep a guaranteed share** — 30% of the budget is reserved by default, so facts cannot starve them.
+- **Cache friendly** — sections are sorted by key, so the injected text is byte-stable while memories do not change and can hit the prompt cache.
+- **Visible** — `memory_stats` reports what the current session injects: characters used, facts/lessons included, and truncated sections.
+
+### Tuning the budget
+
+Optionally create `~/.config/opencode/supereasy-memory/config.json` (next to the database):
+
+```json
+{
+  "maxChars": 8000,
+  "factLineMax": 150,
+  "lessonLineMax": 100,
+  "lessonReserve": 0.3
+}
+```
+
+Missing fields or invalid types fall back to the defaults. The file is read at plugin startup, so restart OpenCode (or trigger a plugin reload) after editing it.
 
 ## Data Storage
 
