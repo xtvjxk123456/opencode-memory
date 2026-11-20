@@ -8,6 +8,8 @@ OpenCode 的持久化记忆插件。移植自优秀的 [pi-memory](https://pi.de
 
 > **版本说明**：`2.0.0` 起基于 **OpenCode 2** 插件 API（V1 的 `1.0.x` 仅支持 OpenCode 1.x）。V1 → V2 沿用同一个 SQLite 数据库，升级不丢记忆。
 
+> **Fork 说明**：本仓库是 [songsongtao/opencode-memory](https://github.com/songsongtao/opencode-memory) 的 fork，独立维护 `2.x`（OpenCode 2）分支。上游自 2026-06 起未再更新，OpenCode 2 移植只存在于本仓库。已验证环境：opencode `v2.1.4` + `@opencode/plugin 2.0.26`。
+
 ## 功能
 
 - **持久化存储** — 使用 SQLite 存储记忆，跨会话持久化

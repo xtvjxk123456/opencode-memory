@@ -8,6 +8,8 @@ This extension gives your AI assistant the ability to remember your preferences,
 
 > **Version note**: `2.0.0` and later target the **OpenCode 2** plugin API (the `1.0.x` line only supports OpenCode 1.x). Both lines share the same SQLite database, so upgrading keeps all memories.
 
+> **Fork note**: This is a fork of [songsongtao/opencode-memory](https://github.com/songsongtao/opencode-memory), maintaining the `2.x` (OpenCode 2) line independently. Upstream has been dormant since 2026-06, and the OpenCode 2 port exists only here. Verified against opencode `v2.1.4` + `@opencode/plugin 2.0.26`.
+
 ## Features
 
 - **Persistent Storage** — Uses SQLite to store memories, ensuring they persist across different OpenCode sessions.
