@@ -18,7 +18,8 @@
  * - 单条内容过长时压成一行并以 `…` 结尾，全文留在库里用 memory_search 取。
  * - 两级注入（2.2.0 起）：值装不下的条目不再被丢弃，而是退化成 `<key_index>` 里的
  *   纯键名。键名比「键名 + 值」小一个数量级，所以记忆库增长时覆盖率只缓慢下降。
- * - 键名也装不下时才截断，并附 `… (+N more keys)` 尾注，绝不静默消失。
+ * - 全量键名都装不下时（大库或长键名），尽量多列键名，再补 `… (+N more keys)` 尾注；
+ *   绝不因为「装不下全部」就把键名整段丢掉。
  * - 教训有保底预算（lessonReserve），事实再多也挤不掉它。
  * - 分区内按 key 排序，内容不变时注入文本逐字节稳定，便于命中 prompt cache。
  */
@@ -184,11 +185,35 @@ const GROUP_NAMES: Record<string, string> = {
   user: "user_identity",
 };
 
+/**
+ * 键名前缀转成合法的 XML 标签名：空格等符号换成下划线，数字/符号开头补 `g_`。
+ * 键名由模型自由生成，`<a b>`、`<1st>` 这样的标签不是合法 XML，会搅乱注入结构。
+ */
+function safeTag(tag: string): string {
+  const cleaned = tag.replace(/[^\p{L}\p{N}_.-]+/gu, "_");
+  return /^[\p{L}_]/u.test(cleaned) ? cleaned : `g_${cleaned}`;
+}
+
 /** 按键名第一个小数点解析出分组标签；没有前缀的归入 general。 */
 function groupTagOf(key: string): string {
   const dotIdx = key.indexOf(".");
   const rawPrefix = dotIdx > 0 ? key.slice(0, dotIdx) : "general";
-  return GROUP_NAMES[rawPrefix] || rawPrefix;
+  return safeTag(GROUP_NAMES[rawPrefix] || rawPrefix);
+}
+
+/**
+ * 记忆内容里的块标记必须中和。否则一条值里出现 `</persistent_memory>` 或 `</memory>`，
+ * 就会提前闭合注入块，后面的文字落到块外 —— 一条记忆就能伪造指令。
+ */
+const BLOCK_MARKERS = /<(\/?)(memory|persistent_memory|key_index)>/g;
+
+function neutralizeMarkers(text: string): string {
+  return text.replace(BLOCK_MARKERS, "&lt;$1$2&gt;");
+}
+
+/** 单行化并中和块标记：值、教训、键名都经过这里再拼进注入块。 */
+function inlineText(text: string): string {
+  return neutralizeMarkers(text.replace(/\s+/g, " ").trim());
 }
 
 /** 渲染一个 XML 分区 */
@@ -205,7 +230,9 @@ function wrapKeys(tag: string, keys: string[]): string[] {
   const lines: string[] = [];
   let current = `${indent}${tag}: `;
   let first = true;
-  for (const key of keys) {
+  for (const rawKey of keys) {
+    // 键名里的换行/块标记会破坏结构，这里统一单行化
+    const key = inlineText(rawKey);
     const piece = first ? key : `, ${key}`;
     if (current.length + piece.length > KEY_LINE_WIDTH && !first) {
       lines.push(current);
@@ -279,11 +306,11 @@ export function buildContextBlock(
   }
 
   const factLine = (e: SemanticEntry): string =>
-    `    - ${humanizeKey(e.key)}: ${clip(e.value, cfg.factLineMax)}`;
+    `    - ${inlineText(humanizeKey(e.key))}: ${inlineText(clip(e.value, cfg.factLineMax))}`;
 
   const lessonLines = lessons.map((l: LessonEntry) => {
     const prefix = l.negative ? "[AVOID]" : "[DO]";
-    return `    ${prefix} ${lessonText(l.rule, cfg.lessonLineMax)}`;
+    return `    ${prefix} ${inlineText(lessonText(l.rule, cfg.lessonLineMax))}`;
   });
 
   // 优先级顺序：保证这些重要的内置分组优先拿到预算
@@ -370,6 +397,8 @@ export function buildContextBlock(
   // 「带值」和「只留键名」共用同一份预算：带值一条 ~150+ 字符，只留键名一条 ~20 字符。
   // 所以在「前 k 条带值、其余留键名」上二分，取预算允许的最大 k ——
   // 结果是宁可少带几条的值，也要让每个条目至少留下键名。
+  // 键名全量都装不下时（大库/长键名），再退一步：能列多少键名列多少 + 尾注剩余数量，
+  // 而不是把整段键名扔掉 —— 那会让注入只剩一行「+N more keys」，等于全库不可见。
   const PRIORITY_TAGS = new Set(priorityOrder);
   const ordered: Array<{ tag: string; entry: SemanticEntry }> = [];
   for (const s of priority) {
@@ -379,8 +408,12 @@ export function buildContextBlock(
     for (const e of s.entries) ordered.push({ tag: s.tag, entry: e });
   }
 
-  /** 前 k 条带值、其余只留键名时的完整渲染结果 */
-  const layoutAt = (k: number) => {
+  /**
+   * 前 k 条带值、第 k～keyLimit 条只留键名，其余不出现。
+   * keyLimit < 总数时在 <key_index> 末尾补一行「+N more keys」。
+   */
+  const layoutAt = (k: number, keyLimit: number = ordered.length) => {
+    const limit = Math.min(ordered.length, Math.max(k, keyLimit));
     const buckets = new Map<
       string,
       { tag: string; values: SemanticEntry[]; keys: string[] }
@@ -393,7 +426,7 @@ export function buildContextBlock(
         buckets.set(item.tag, bucket);
       }
       if (i < k) bucket.values.push(item.entry);
-      else bucket.keys.push(item.entry.key);
+      else if (i < limit) bucket.keys.push(item.entry.key);
     }
 
     const priorityParts: string[] = [];
@@ -415,13 +448,13 @@ export function buildContextBlock(
       }
     }
 
+    const keyLines = groups.flatMap((g) => wrapKeys(g.tag, g.keys));
+    const omitted = ordered.length - limit;
+    if (omitted > 0) {
+      keyLines.push(`    … (+${omitted} more keys — memory_list)`);
+    }
     const indexText =
-      groups.length > 0
-        ? renderSection(
-            "key_index",
-            groups.flatMap((g) => wrapKeys(g.tag, g.keys)),
-          )
-        : "";
+      keyLines.length > 0 ? renderSection("key_index", keyLines) : "";
     const length = [...priorityParts, ...restParts, indexText]
       .filter(Boolean)
       .join("\n").length;
@@ -445,19 +478,23 @@ export function buildContextBlock(
 
   let layout = layoutAt(bestK);
   if (layout.length > factsBudget) {
-    // 连键名都装不下：至少留一行交代丢了多少条，而不是静默消失
-    const trailer = renderSection("key_index", [
-      `    … (+${ordered.length} more keys — memory_list)`,
-    ]);
-    const fits = trailer.length <= factsBudget;
-    layout = {
-      priorityParts: [],
-      restParts: [],
-      indexText: fits ? trailer : "",
-      semantic: 0,
-      keys: 0,
-      length: fits ? trailer.length : 0,
-    };
+    // 连全量键名都装不下：二分「能列多少条键名」，最大化可见条目
+    let loKey = 0;
+    let hiKey = ordered.length;
+    let bestKeys = -1;
+    while (loKey <= hiKey) {
+      const mid = (loKey + hiKey) >> 1;
+      if (layoutAt(0, mid).length <= factsBudget) {
+        bestKeys = mid;
+        loKey = mid + 1;
+      } else {
+        hiKey = mid - 1;
+      }
+    }
+    layout =
+      bestKeys >= 0
+        ? layoutAt(0, bestKeys)
+        : { priorityParts: [], restParts: [], indexText: "", semantic: 0, keys: 0, length: 0 };
   }
 
   const semanticCount = layout.semantic;

@@ -2,10 +2,11 @@
  * 基于 SQLite 驱动的持久化记忆存储层，底层使用 Bun 原生的 bun:sqlite。
  *
  * 移植自 pi-memory (https://github.com/samfoy/pi-memory)。
- * 数据库包含三张核心表:
+ * 数据库包含四张核心表:
  * - semantic: 键值对形式的事实记忆 (偏好设置、项目级开发模式、工具偏好)
  * - lessons: 学习到的经验教训，包含去重机制 (基于 Jaccard 相似度)
  * - events: 审计日志表，记录所有的记忆读写操作
+ * - semantic_history: 覆盖写留下的旧值（只追加；遗忘时清空）
  *
  * 默认尝试使用 FTS5 引擎进行全文搜索；如果环境不支持 FTS5，则自动降级使用 LIKE 模糊匹配。
  */
@@ -179,6 +180,18 @@ function normalizeForCompare(text: string): string {
 }
 
 /**
+ * 把「实例编号」归一化：数字、含数字的标识符（module_1、v20.11.0）、路径段都换成 `#`。
+ * 用来识别「只差一个编号」的平行规则 —— 它们相似度往往 > 0.9，但讲的是不同对象，
+ * 在写入期按相似度拒收就是误拒（module_1 的规则进不了库）。
+ */
+function normalizeIdentifiers(text: string): string {
+  return text
+    .replace(/[a-z0-9_./\\-]*\d[a-z0-9_./\\-]*/gi, "#")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
  * 两条记忆是否在讲同一件事。
  *
  * 判定分两种口径：
@@ -346,6 +359,20 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_semantic_history_key
         ON semantic_history(key, replaced_at DESC);
     `);
+
+    // v2.3.1 迁移：早期版本用 is_deleted 软删除，规则文本一直留在库里。
+    // 这些教训是用户当时明确要求「忘掉」的，这里物理清掉并抹掉事件日志里的内容。
+    // 新版 deleteLesson 已是硬删除，不会再产生这类行。
+    const legacyDeleted = this.db
+      .prepare(`SELECT id FROM lessons WHERE is_deleted = 1`)
+      .all() as Array<{ id: string }>;
+    if (legacyDeleted.length > 0) {
+      const redactLegacy = this.db.prepare(
+        `UPDATE events SET details = '[redacted]' WHERE memory_type = 'lesson' AND memory_key = ?`,
+      );
+      for (const row of legacyDeleted) redactLegacy.run(row.id);
+      this.db.exec(`DELETE FROM lessons WHERE is_deleted = 1`);
+    }
 
     // 创建用于全文搜索的 FTS5 虚拟表及触发器 (bun:sqlite 的部分环境可能不支持)
     try {
@@ -614,6 +641,9 @@ export class MemoryStore {
    * 如果 project 传 null，则只删除全局记录。
    * 如果 project 是字符串，则仅删除对应项目的记录。
    *
+   * 这是「用户明确要求忘掉」的路径，所以连留档一起清：semantic_history 里的旧值和
+   * events 里的值都会被抹掉，否则工具说「已删除」而库里仍留着明文。
+   *
    * @param key 要删除的键名
    * @param project 目标项目标识 (可选)
    * @returns {boolean} 如果有成功删除的记录则返回 true
@@ -633,10 +663,40 @@ export class MemoryStore {
         .run(key, project);
     }
     if (result.changes > 0) {
+      this.purgeSemanticTraces(key, project);
       this.logEvent("delete", "semantic", key, project ?? "global");
       return true;
     }
     return false;
+  }
+
+  /**
+   * 清掉一条事实的可回溯痕迹（只给 deleteSemantic 用）：
+   * - semantic_history 里留档的旧值（按作用域匹配）
+   * - events.details 里的值（事件行保留，内容改成 [redacted]）
+   */
+  private purgeSemanticTraces(key: string, project?: string | null): void {
+    if (project === undefined) {
+      this.db.prepare(`DELETE FROM semantic_history WHERE key = ?`).run(key);
+    } else if (project === null) {
+      this.db
+        .prepare(`DELETE FROM semantic_history WHERE key = ? AND project IS NULL`)
+        .run(key);
+    } else {
+      this.db
+        .prepare(`DELETE FROM semantic_history WHERE key = ? AND project = ?`)
+        .run(key, project);
+    }
+
+    const scopeTag =
+      project === undefined ? null : project === null ? "[global] " : `[project: ${project}] `;
+    const rows = this.db
+      .prepare(`SELECT id, details FROM events WHERE memory_type = 'semantic' AND memory_key = ?`)
+      .all(key) as Array<{ id: number; details: string }>;
+    const redact = this.db.prepare(`UPDATE events SET details = '[redacted]' WHERE id = ?`);
+    for (const row of rows) {
+      if (scopeTag === null || row.details.startsWith(scopeTag)) redact.run(row.id);
+    }
   }
 
   /**
@@ -688,25 +748,6 @@ export class MemoryStore {
     }
 
     return rows;
-  }
-
-  /**
-   * 通过键名前缀提取所有对应的事实记忆记录。
-   * 通常用于导出某一特定分类下的记忆。
-   *
-   * @param prefix 需要匹配的前缀 (如 'pref.')
-   * @param limit 返回的最大条数 (默认 50)
-   * @returns 匹配到的记录数组
-   */
-  getSemanticByPrefix(prefix: string, limit: number = 50): SemanticEntry[] {
-    const stmt = this.db.prepare(`
-      SELECT key, value, confidence, source, created_at, updated_at, last_accessed, project, superseded_by
-      FROM semantic
-      WHERE key LIKE ?
-      ORDER BY updated_at DESC
-      LIMIT ?
-    `);
-    return stmt.all(`${prefix}%`, limit) as SemanticEntry[];
   }
 
   /**
@@ -773,77 +814,15 @@ export class MemoryStore {
     };
   }
 
-  /**
-   * 更新某条事实记忆的作用域属性。
-   * 可用于将一条记忆从全局移动到局部，或者反之。
-   *
-   * @param key 要操作的键名
-   * @param fromProject 原有的项目作用域标识 (null 代表全局)
-   * @param toProject 目标的项目作用域标识 (null 代表全局)
-   * @returns {boolean} 操作是否成功
-   */
-  updateScope(
-    key: string,
-    fromProject: string | null,
-    toProject: string | null,
-  ): boolean {
-    // 首先检查目标作用域下是否已经有了该键名
-    const targetExists =
-      toProject === null
-        ? this.db
-            .prepare(`SELECT 1 FROM semantic WHERE key = ? AND project IS NULL`)
-            .get(key)
-        : this.db
-            .prepare(`SELECT 1 FROM semantic WHERE key = ? AND project = ?`)
-            .get(key, toProject);
-
-    if (targetExists) {
-      // 目标作用域已存在相同记录 — 直接删掉源记录，保留目标记录即可
-      if (fromProject === null) {
-        this.db
-          .prepare(`DELETE FROM semantic WHERE key = ? AND project IS NULL`)
-          .run(key);
-      } else {
-        this.db
-          .prepare(`DELETE FROM semantic WHERE key = ? AND project = ?`)
-          .run(key, fromProject);
-      }
-    } else {
-      // 目标不存在冲突，直接执行移动逻辑：更新该条记录的 project 字段
-      if (fromProject === null) {
-        this.db
-          .prepare(
-            `UPDATE semantic SET project = ?, updated_at = datetime('now') WHERE key = ? AND project IS NULL`,
-          )
-          .run(toProject, key);
-      } else {
-        if (toProject === null) {
-          this.db
-            .prepare(
-              `UPDATE semantic SET project = NULL, updated_at = datetime('now') WHERE key = ? AND project = ?`,
-            )
-            .run(key, fromProject);
-        } else {
-          this.db
-            .prepare(
-              `UPDATE semantic SET project = ?, updated_at = datetime('now') WHERE key = ? AND project = ?`,
-            )
-            .run(toProject, key, fromProject);
-        }
-      }
-    }
-
-    const fromLabel = fromProject ?? "global";
-    const toLabel = toProject ?? "global";
-    this.logEvent("scope_change", "semantic", key, `${fromLabel} → ${toLabel}`);
-    return true;
-  }
-
   // ─── 经验教训 (Lessons) 操作 ─────────────────────────────────────────────────────
 
   /**
    * 增加一条经验教训。
-   * 此方法内置了 Jaccard 去重逻辑，可以拦截高度相似的重复记录。
+   * 此方法内置了相似度去重逻辑，可以拦截高度相似的重复记录。
+   *
+   * 去重只在「同类别 + 同方向 (AVOID/DO) + 同作用域」内进行：跨项目/跨方向比较会把
+   * 另一处成立的规则误判成重复，让新规则根本落不了库。只差实例编号的平行规则
+   * （module_1 / module_2）也不算重复。
    *
    * @param rule 教训规则的具体内容
    * @param category 类别 (如 'git', 'coding')
@@ -859,10 +838,14 @@ export class MemoryStore {
     source: string = "user",
     project: string | null = null,
   ): string | null {
-    // 使用完全匹配和 Jaccard 相似度来检查是否有重复
-    const existing = this.getLessons();
+    const scope = project ?? null;
+    const existing = this.getLessons().filter(
+      (l) => l.category === category && l.negative === negative && (l.project ?? null) === scope,
+    );
     for (const lesson of existing) {
       if (lesson.rule === rule) return null; // 完全一致的重复
+      // 只差编号/路径的平行规则不是重复（否则 module_2 的规则会被 module_1 拒收）
+      if (normalizeIdentifiers(lesson.rule) === normalizeIdentifiers(rule)) continue;
       if (jaccardSimilarity(lesson.rule, rule) >= 0.7) return null; // 语义足够相似
     }
 
@@ -878,17 +861,22 @@ export class MemoryStore {
   }
 
   /**
-   * 通过 ID 删除一条经验教训 (采用软删除策略：is_deleted = 1)。
+   * 通过 ID 删除一条经验教训（硬删除 + 抹掉审计日志里的规则文本）。
+   *
+   * 早期版本用 `is_deleted = 1` 软删除，规则文本一直留在库里；用户明确说「忘了这个」
+   * 时那等于没删干净。历史软删除的行保持原样，新删除走硬删除。
    *
    * @param id 教训的主键 ID
    * @returns 是否成功删除
    */
   deleteLesson(id: string): boolean {
-    const stmt = this.db.prepare(
-      `UPDATE lessons SET is_deleted = 1 WHERE id = ?`,
-    );
-    const result = stmt.run(id);
+    const result = this.db.prepare(`DELETE FROM lessons WHERE id = ?`).run(id);
     if (result.changes > 0) {
+      this.db
+        .prepare(
+          `UPDATE events SET details = '[redacted]' WHERE memory_type = 'lesson' AND memory_key = ?`,
+        )
+        .run(id);
       this.logEvent("delete", "lesson", id, "");
       return true;
     }
@@ -912,6 +900,34 @@ export class MemoryStore {
       Omit<LessonEntry, "negative"> & { negative: number }
     >;
     return rows.map((r) => ({ ...r, negative: r.negative === 1 }));
+  }
+
+  /**
+   * 按当前项目作用域分页列出有效教训（新→旧，按 id 保证顺序稳定）。
+   * 用于 `memory_list({ type: "lesson" })`：教训超过 statistics 倾倒上限后，
+   * 没有它就只能靠关键词搜索，拿不到 id 也就删不掉单条。
+   *
+   * @param offset 跳过多少条
+   * @param limit 最多返回多少条
+   * @param projectId 当前项目标识（全局 + 该项目）
+   * @param includeSuperseded 是否包含已被整合取代的教训 (默认 false)
+   */
+  listLessonPage(
+    offset: number,
+    limit: number,
+    projectId?: string | null,
+    includeSuperseded: boolean = false,
+  ): { entries: LessonEntry[]; total: number } {
+    const all = this.getLessons(includeSuperseded)
+      .filter((l) => !l.project || !projectId || l.project === projectId)
+      .sort(
+        (a, b) =>
+          b.created_at.localeCompare(a.created_at) || a.id.localeCompare(b.id),
+      );
+    return {
+      entries: all.slice(offset, offset + limit),
+      total: all.length,
+    };
   }
 
   /**

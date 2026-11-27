@@ -10,9 +10,10 @@
  *   故 V1 的 `experimental.session.compacting` 钩子不再需要。
  * - 注入层是「索引」：长条目压成一行，全文留在库里用 memory_search 取；值装不下的条目
  *   退化成 <key_index> 里的纯键名，用 memory_get / memory_list 确定性取回
- *   （详见 injector.ts 与 config.json）。
+ *   （详见 injector.ts 与 config.json）。键名也装不下时尽量多列 + 数量尾注，不会整段归零。
  * - 整合（consolidation）：重复条目收成一条主记录，其余标 superseded_by（不删除），
  *   注入只面对有效记录；启动时自动跑一次保守整合，也可用 memory_consolidate 手动触发。
+ * - 遗忘（memory_forget）是永久删除：连同 semantic_history 与事件日志里的值一起清掉。
  * - 子代理会话（`session.parentID` 非空）跳过注入，保持子代理上下文纯粹。
  * - 存储层 store.ts / 注入器 injector.ts 与 V1 完全一致，继续使用同一个
  *   SQLite 数据库（~/.config/opencode/supereasy-memory/supereasy-memory.db）。
@@ -22,6 +23,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync, existsSync, readFileSync } from "node:fs";
 import { MemoryStore, DEFAULT_CONSOLIDATION_THRESHOLD } from "./store.js";
+import type { LessonEntry, SemanticEntry } from "./store.js";
 import {
   buildContextBlock,
   resolveProjectId,
@@ -143,6 +145,23 @@ function preview(text: string, max: number = 160): string {
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
+/** memory_stats 内联倾倒的上限：条数或总字符任一超限，就只给摘要 */
+export const STATS_DUMP_MAX_ENTRIES = 40;
+export const STATS_DUMP_MAX_CHARS = 6000;
+
+/**
+ * 估算整库倾倒的字符数。
+ * 只按条数限制不够：40 条长记忆就能倾倒出四万字符，直接挤爆工具返回值。
+ */
+export function estimateDumpChars(
+  entries: SemanticEntry[],
+  lessons: LessonEntry[],
+): number {
+  const facts = entries.reduce((n, e) => n + e.key.length + e.value.length + 40, 0);
+  const rules = lessons.reduce((n, l) => n + l.rule.length + 90, 0);
+  return facts + rules;
+}
+
 // ─── 工具定义层 ────────────────────────────────────────────────
 
 interface MemoryTool {
@@ -154,7 +173,7 @@ interface MemoryTool {
 }
 
 /**
- * 构建 4 个记忆工具。
+ * 构建 7 个记忆工具。
  * 工具是一段闭包，项目标识在插件 setup 时解析并捕获。
  *
  * @param projectId 当前项目的唯一标识（git remote URL 或目录路径）
@@ -203,8 +222,9 @@ function buildTools(
       if (semanticResults.length > 0) {
         parts.push("## Facts");
         for (const entry of semanticResults) {
+          const scope = entry.project ? `[project: ${entry.project}]` : "[global]";
           parts.push(
-            `- **${entry.key}**: ${entry.value} (confidence: ${entry.confidence})`,
+            `- **${entry.key}** ${scope}: ${entry.value} (confidence: ${entry.confidence})`,
           );
         }
       }
@@ -213,7 +233,10 @@ function buildTools(
         parts.push("## Lessons");
         for (const lesson of lessonResults) {
           const prefix = lesson.negative ? "[AVOID]" : "[DO]";
-          parts.push(`- ${prefix} ${lesson.rule} (category: ${lesson.category})`);
+          const scope = lesson.project ? `[project: ${lesson.project}]` : "[global]";
+          parts.push(
+            `- ${prefix} ${lesson.rule} (category: ${lesson.category}) ${scope} [id: ${lesson.id}]`,
+          );
         }
       }
 
@@ -266,7 +289,8 @@ function buildTools(
             history
               .map((h) => {
                 const value = h.value.length > 300 ? `${h.value.slice(0, 300)}…` : h.value;
-                return `- [${h.replaced_at}] ${value}`;
+                const scope = h.project ? `[project: ${h.project}]` : "[global]";
+                return `- [${h.replaced_at}] ${scope} ${value}`;
               })
               .join("\n"),
         );
@@ -279,23 +303,29 @@ function buildTools(
   const memoryList: MemoryTool = {
     name: "memory_list",
     description:
-      "Page through stored facts in key order, without needing a keyword. Use it to browse one category by prefix (e.g. \"pref\", \"tool.\", \"project.build\") or to enumerate what exists when memory_search misses. Full values are returned, 20 per page; pass offset to continue.",
+      "Page through stored memories in a stable order, without needing a keyword. Use type \"fact\" (default) to browse by key prefix (e.g. \"pref\", \"tool.\", \"project.build\"), or type \"lesson\" to enumerate lessons (returns id + scope, so a single lesson can be forgotten). Full values are returned, 20 per page; pass offset to continue.",
     options: direct,
     input: {
       type: "object",
       properties: {
+        type: {
+          type: "string",
+          enum: ["fact", "lesson"],
+          description:
+            'What to list: "fact" (default) for key-value facts, "lesson" for lessons.',
+        },
         prefix: {
           type: "string",
           description:
-            'Key prefix to filter by, e.g. "pref" or "tool.bulk_". Omit to list everything.',
+            'Key prefix to filter by (facts only), e.g. "pref" or "tool.bulk_". Omit to list everything.',
         },
         offset: {
           type: "number",
-          description: "How many matching facts to skip (default: 0)",
+          description: "How many matching entries to skip (default: 0)",
         },
         limit: {
           type: "number",
-          description: "How many facts to return, 1-100 (default: 20)",
+          description: "How many entries to return, 1-100 (default: 20)",
         },
         include_superseded: {
           type: "boolean",
@@ -307,11 +337,13 @@ function buildTools(
     },
     async execute(rawInput) {
       const args = (rawInput ?? {}) as {
+        type?: string;
         prefix?: string;
         offset?: number;
         limit?: number;
         include_superseded?: boolean;
       };
+      const type = stripQuotes(String(args.type ?? "fact")).trim() || "fact";
       const prefix = stripQuotes(String(args.prefix ?? "")).trim();
       const clamp = (value: unknown, fallback: number, min: number, max: number): number => {
         const n = typeof value === "number" ? value : Number(value);
@@ -320,6 +352,39 @@ function buildTools(
       };
       const offset = clamp(args.offset, 0, 0, 1_000_000);
       const limit = clamp(args.limit, 20, 1, 100);
+
+      if (type === "lesson") {
+        const { entries, total } = getStore().listLessonPage(
+          offset,
+          limit,
+          projectId,
+          args.include_superseded === true,
+        );
+        if (total === 0) {
+          return { content: "No lessons found." };
+        }
+        if (entries.length === 0) {
+          return { content: `Offset ${offset} is past the end: ${total} lessons found.` };
+        }
+        const parts = [
+          `Showing ${offset + 1}-${offset + entries.length} of ${total} lessons.`,
+        ];
+        for (const lesson of entries) {
+          const prefixTag = lesson.negative ? "[AVOID]" : "[DO]";
+          const scope = lesson.project ? `[project: ${lesson.project}]` : "[global]";
+          const state = lesson.superseded_by
+            ? ` [superseded by ${lesson.superseded_by}]`
+            : "";
+          parts.push(
+            `- ${prefixTag} ${lesson.rule} (category: ${lesson.category}) ${scope}${state} (created ${lesson.created_at}) [id: ${lesson.id}]`,
+          );
+        }
+        const next = offset + entries.length;
+        if (next < total) {
+          parts.push(`\nmore: memory_list({ type: "lesson", offset: ${next} })`);
+        }
+        return { content: parts.join("\n") };
+      }
 
       const { entries, total } = getStore().listSemanticPage(
         prefix,
@@ -479,7 +544,7 @@ function buildTools(
   const memoryForget: MemoryTool = {
     name: "memory_forget",
     description:
-      "Delete a specific memory by its key (for facts) or ID (for lessons). Use this when the user says 'forget this' (忘了这个), 'delete memory' (删除记忆). For facts, deletes both global and project-scoped versions unless scope is specified.",
+      "Permanently delete a specific memory by its key (for facts) or ID (for lessons). Use this when the user says 'forget this' (忘了这个), 'delete memory' (删除记忆). For facts, deletes both global and project-scoped versions unless scope is specified. This is a real delete: the value is also removed from overwrite history and redacted from the event log, so it cannot be recovered.",
     options: direct,
     input: {
       type: "object",
@@ -631,20 +696,22 @@ function buildTools(
       const recentEvents = s.getRecentEvents(5);
       const allLessons = s.getLessons();
 
-      // 按作用域统计数据
+      // 按作用域统计数据：当前项目的条目才参与本项目的注入，其他项目的单独列出
       let globalCount = 0;
-      let projectCount = 0;
+      let currentProjectCount = 0;
+      let otherProjectCount = 0;
       const prefixCounts = new Map<string, number>();
       for (const entry of allEntries) {
-        if (entry.project) projectCount++;
-        else globalCount++;
+        if (!entry.project) globalCount++;
+        else if (entry.project === projectId) currentProjectCount++;
+        else otherProjectCount++;
         const prefix = entry.key.split(".")[0] || "other";
         prefixCounts.set(prefix, (prefixCounts.get(prefix) || 0) + 1);
       }
 
       const parts = [
         "## Memory Statistics",
-        `- **Facts**: ${stats.semanticCount} (effective global: ${globalCount}, effective project: ${projectCount}, superseded: ${stats.semanticSuperseded})`,
+        `- **Facts**: ${stats.semanticCount} (effective global: ${globalCount}, current project: ${currentProjectCount}, other projects: ${otherProjectCount}, superseded: ${stats.semanticSuperseded})`,
         `- **Lessons**: ${stats.lessonCount} (superseded: ${stats.lessonSuperseded})`,
         `- **Events logged**: ${stats.eventCount}`,
         `- **Current project**: ${projectName} (${projectId})`,
@@ -699,12 +766,18 @@ function buildTools(
 
       parts.push("\n### All Stored Memories");
 
-      // 库大了就不再整库倾倒（会撑爆工具返回值），只给出各分类计数与取回入口
-      const DUMP_LIMIT = 40;
-      if (allEntries.length > DUMP_LIMIT || allLessons.length > DUMP_LIMIT) {
+      // 库大了就不再整库倾倒（会撑爆工具返回值），只给出各分类计数与取回入口。
+      // 条数和字符双重限制：长记忆 40 条就能有数万字符。
+      const dumpChars = estimateDumpChars(allEntries, allLessons);
+      if (
+        allEntries.length > STATS_DUMP_MAX_ENTRIES ||
+        allLessons.length > STATS_DUMP_MAX_ENTRIES ||
+        dumpChars > STATS_DUMP_MAX_CHARS
+      ) {
         parts.push(
-          `- ${allEntries.length} facts, ${allLessons.length} lessons — too many to dump inline.`,
+          `- ${allEntries.length} facts, ${allLessons.length} lessons — too large to dump inline (${dumpChars} chars, limit ${STATS_DUMP_MAX_CHARS}).`,
           `- Browse: memory_list({ prefix: "pref" }) (keys in order, paged)`,
+          `- Browse lessons: memory_list({ type: "lesson" }) (includes ids)`,
           `- Fetch one: memory_get({ key: "pref.commit_style" })`,
           `- Tidy up: memory_consolidate (dry run by default)`,
         );
@@ -788,7 +861,7 @@ const plugin: Plugin.Plugin = {
       }
     }
 
-    // 注册 4 个记忆工具
+    // 注册 7 个记忆工具
     await ctx.tool.transform((editor) => {
       for (const tool of buildTools(projectId, projectName, injectionConfig)) {
         editor.add(tool as never);
