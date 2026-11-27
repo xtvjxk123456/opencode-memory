@@ -167,8 +167,8 @@ if (lessonSearch.length === 0) {
 }
 console.log(`   ✓ 第一条结果: ${lessonSearch[0].rule}\n`);
 
-// 测试 14: 注入预算分配与压缩（模拟长期使用后膨胀的库）
-console.log("14. 测试注入预算分配与压缩...");
+// 测试 14: 两级注入（值 + 键名索引）在长期膨胀的库上仍然不丢条目
+console.log("14. 测试两级注入与键名索引...");
 for (let i = 0; i < 60; i++) {
   // 每条 600+ 字，模拟实际库里的长笔记
   store.upsertSemantic(`tool.bulk_${i}`, `bulk value ${i} ` + "长".repeat(600), 0.9, "user");
@@ -183,7 +183,7 @@ for (let i = 0; i < 30; i++) {
 }
 const bigBlock = buildContextBlock(store, undefined);
 console.log(
-  `   注入块: ${bigBlock.stats.chars}/${bigBlock.stats.maxChars} 字符, 事实 ${bigBlock.stats.semantic}/${bigBlock.stats.semanticTotal}, 教训 ${bigBlock.stats.lessons}/${bigBlock.stats.lessonsTotal}`,
+  `   注入块: ${bigBlock.stats.chars}/${bigBlock.stats.maxChars} 字符, 带值 ${bigBlock.stats.semantic}, 键名 ${bigBlock.stats.keys}, 事实共 ${bigBlock.stats.semanticTotal}, 教训 ${bigBlock.stats.lessons}/${bigBlock.stats.lessonsTotal}`,
 );
 console.log(`   被截断的分区: ${JSON.stringify(bigBlock.stats.truncated)}`);
 if (bigBlock.stats.chars > bigBlock.stats.maxChars) {
@@ -198,12 +198,26 @@ if (!bigBlock.text.includes("<lessons>")) {
   console.error("   ✗ 预期应该包含 <lessons> 分区！");
   process.exit(1);
 }
-if (!bigBlock.text.includes("more — memory_search")) {
-  console.error("   ✗ 超出上限时应该出现 (+N more) 尾注！");
+// 超预算的条目必须退化成键名，而不是消失
+if (bigBlock.stats.keys === 0 || !bigBlock.text.includes("<key_index>")) {
+  console.error("   ✗ 超出预算的事实应该退化成 <key_index> 键名！");
   process.exit(1);
 }
-if (bigBlock.stats.truncated.length === 0) {
-  console.error("   ✗ 预期应该记录被截断的分区！");
+for (let i = 0; i < 60; i++) {
+  // 带值的行用 humanizeKey 把 tool.bulk_3 变成 "bulk 3"；键名索引里是完整键名
+  const inline = bigBlock.text.includes(`bulk ${i}:`);
+  const indexed = bigBlock.text.includes(`bulk_${i}`);
+  if (!inline && !indexed) {
+    console.error(`   ✗ 键名 tool.bulk_${i} 在注入块里完全找不到！`);
+    process.exit(1);
+  }
+}
+// 账要能对上：带值 + 只有键名 + 连键名都没放下 = 事实总数
+const dropped = bigBlock.stats.truncated
+  .filter((t) => t.section === "key_index")
+  .reduce((n, t) => n + t.dropped, 0);
+if (bigBlock.stats.semantic + bigBlock.stats.keys + dropped !== bigBlock.stats.semanticTotal) {
+  console.error("   ✗ 事实条数对不上（有条目既没带值也没留键名）！");
   process.exit(1);
 }
 // 稳定性：内容不变时两次构建结果必须一致（prompt cache 友好）
@@ -211,7 +225,7 @@ if (buildContextBlock(store, undefined).text !== bigBlock.text) {
   console.error("   ✗ 两次构建的注入文本不一致！");
   process.exit(1);
 }
-console.log("   ✓ 超限时压缩 + 保底教训 + 记录截断 + 输出稳定\n");
+console.log("   ✓ 超限时值降级为键名 + 保底教训 + 条数可对账 + 输出稳定\n");
 
 // 测试 15: 自定义上限
 console.log("15. 测试自定义 maxChars...");
@@ -272,6 +286,198 @@ if (enStillOk.length === 0) {
   process.exit(1);
 }
 console.log("   ✓ 中文（含单字）走 LIKE 命中，英文仍走 FTS 正常\n");
+
+// 测试 18: 收紧预算后账仍然对得上（不静默丢条目）
+console.log("18. 测试收紧预算后的条目对账...");
+for (const maxChars of [4000, 2500, 1500]) {
+  const b = buildContextBlock(store, undefined, {
+    maxChars,
+    factLineMax: 150,
+    lessonLineMax: 100,
+    lessonReserve: 0.3,
+  });
+  const drop = b.stats.truncated
+    .filter((t) => t.section === "key_index")
+    .reduce((n, t) => n + t.dropped, 0);
+  console.log(
+    `   ${maxChars} 上限: ${b.stats.chars} 字符, 带值 ${b.stats.semantic}, 键名 ${b.stats.keys}, 丢弃 ${drop}, 教训 ${b.stats.lessons}`,
+  );
+  if (b.stats.chars > maxChars) {
+    console.error(`   ✗ ${maxChars} 上限被突破！`);
+    process.exit(1);
+  }
+  if (b.stats.semantic + b.stats.keys + drop !== b.stats.semanticTotal) {
+    console.error(`   ✗ ${maxChars} 上限下有条目既没带值也没留键名，账对不上！`);
+    process.exit(1);
+  }
+  if (drop > 0 && !b.text.includes("more keys — memory_list")) {
+    console.error(`   ✗ ${maxChars} 上限下有丢弃，却没有留下约定数量的尾注！`);
+    process.exit(1);
+  }
+}
+if (!buildContextBlock(store, undefined, { maxChars: 1500, factLineMax: 150, lessonLineMax: 100, lessonReserve: 0.3 }).stats.lessons) {
+  console.error("   ✗ 收紧到 1500 时教训保底失效！");
+  process.exit(1);
+}
+console.log("   ✓ 任意预算下 带值 + 键名 + 丢弃 = 总数\n");
+
+// 测试 19: memory_get / memory_list 背后的取回接口
+console.log("19. 测试确定性取回 (getSemanticByKey / listSemanticPage)...");
+store.upsertSemantic("pref.theme", "dark", 0.9, "user");
+store.upsertSemantic("pref.theme", "light", 0.9, "user", "project-x");
+const themeRows = store.getSemanticByKey("pref.theme");
+console.log(`   pref.theme 取回 ${themeRows.length} 条: ${themeRows.map((r) => r.project ?? "global").join(", ")}`);
+if (themeRows.length !== 2) {
+  console.error("   ✗ 同一 key 的全局 + 项目版本都应该取回！");
+  process.exit(1);
+}
+if (themeRows[0].project !== "project-x") {
+  console.error("   ✗ 项目级版本应该排在前面（覆盖关系最具体）！");
+  process.exit(1);
+}
+if (store.getSemanticByKey("no.such.key").length !== 0) {
+  console.error("   ✗ 不存在的 key 应该返回空数组！");
+  process.exit(1);
+}
+
+const page1 = store.listSemanticPage("tool.bulk_", 0, 5);
+const page2 = store.listSemanticPage("tool.bulk_", 5, 5);
+const prefPage = store.listSemanticPage("pref", 0, 100);
+console.log(
+  `   tool.bulk_ 共 ${page1.total} 条, 第一页 ${page1.entries.length} 条, 第二页首条 ${page2.entries[0]?.key}`,
+);
+if (page1.total !== 60 || page1.entries.length !== 5) {
+  console.error("   ✗ 分页数量不对！");
+  process.exit(1);
+}
+if (page1.entries[0].key === page2.entries[0].key) {
+  console.error("   ✗ offset 没有生效（两页返回了同一条）！");
+  process.exit(1);
+}
+if (page1.entries[0].key > page1.entries[1].key) {
+  console.error("   ✗ 分页结果没有按 key 排序（翻页顺序不稳定）！");
+  process.exit(1);
+}
+if (prefPage.entries.length === 0 || !prefPage.entries.every((e) => e.key.startsWith("pref."))) {
+  console.error("   ✗ 前缀 \"pref\"（不带点）也应该匹配 pref.* ！");
+  process.exit(1);
+}
+console.log("   ✓ 精确取回含多作用域、前缀分页有序且不重复\n");
+
+// 测试 20: 覆盖写留档（旧值不再永久丢失）
+console.log("20. 测试语义历史 (semantic_history)...");
+store.upsertSemantic("test.history", "v1 初版", 0.9, "user");
+store.upsertSemantic("test.history", "v2 修订", 0.9, "user");
+const history = store.getSemanticHistory("test.history");
+console.log(`   test.history 历史 ${history.length} 条: ${history.map((h) => h.value).join(" / ")}`);
+if (history.length !== 1 || history[0].value !== "v1 初版") {
+  console.error("   ✗ 覆盖写之前的旧值应该留在历史里！");
+  process.exit(1);
+}
+console.log("   ✓ 覆盖写会留档旧值\n");
+
+// 测试 21: 事实整合（包含关系 → 合并成一条，其余标 superseded）
+console.log("21. 测试事实整合 (consolidation)...");
+store.upsertSemantic("dup.a", "Prefer rg over grep for searching", 0.9, "user");
+store.upsertSemantic("dup.b", "Prefer rg over grep for searching files", 0.9, "user");
+const factsBefore = store.getAllSemantic().length;
+const plan = store.planConsolidation({ threshold: 0.7 });
+const dupGroup = plan.find(
+  (g) => g.kind === "fact" && g.keep.startsWith("dup.") && g.drop.some((k) => k.startsWith("dup.")),
+);
+if (!dupGroup) {
+  console.error("   ✗ 应该规划出一组 dup.* 的合并！");
+  process.exit(1);
+}
+console.log(
+  `   规划: keep=${dupGroup.keep} drop=${dupGroup.drop.join(",")} similarity=${dupGroup.similarity}`,
+);
+if (dupGroup.keep !== "dup.b") {
+  console.error("   ✗ 应保留内容更长的那条（信息更全）！");
+  process.exit(1);
+}
+// dry run 不应改动数据库
+if (store.getAllSemantic().length !== factsBefore) {
+  console.error("   ✗ 只规划不应改动数据库！");
+  process.exit(1);
+}
+const applied = store.applyConsolidation([dupGroup]);
+const factsAfter = store.getAllSemantic().length;
+if (applied.facts !== 1 || factsAfter !== factsBefore - 1) {
+  console.error("   ✗ 整合后有效事实数应该减少 1！");
+  process.exit(1);
+}
+const supersededRow = store.getSemanticByKey("dup.a")[0];
+if (supersededRow?.superseded_by !== "dup.b") {
+  console.error("   ✗ 被合并的条目应指向保留条目，而不是被删除！");
+  process.exit(1);
+}
+if (store.listSemanticPage("dup", 0, 10).total !== 1) {
+  console.error("   ✗ 分页默认应只列有效条目！");
+  process.exit(1);
+}
+if (store.listSemanticPage("dup", 0, 10, null, true).total !== 2) {
+  console.error("   ✗ include_superseded 时应能列出被取代的条目！");
+  process.exit(1);
+}
+// 幂等：再规划一次不应重复合并同一批
+const planAgain = store.planConsolidation({ threshold: 0.7 });
+if (planAgain.some((g) => g.drop.includes("dup.a"))) {
+  console.error("   ✗ 整合不幂等（已取代的条目又被规划了一次）！");
+  process.exit(1);
+}
+console.log("   ✓ 合并成一条 + 被取代的仍可查 + 幂等\n");
+
+// 测试 22: 教训整合与作用域隔离
+console.log("22. 测试教训整合与作用域隔离...");
+const l1 = store.addLesson("Never echo append to daily notes", "notes", true, "user");
+const l2 = store.addLesson(
+  "Never echo append to daily notes, use sed instead",
+  "notes",
+  true,
+  "user",
+);
+if (!l1 || !l2) {
+  console.error("   ✗ 两条应通过写入期去重（相似度 < 0.7）！");
+  process.exit(1);
+}
+store.upsertSemantic("scope.check", "same value here for scope test", 0.9, "user");
+store.upsertSemantic("scope.check", "same value here for scope test", 0.9, "user", "proj-x");
+
+const plan2 = store.planConsolidation({ threshold: 0.7 });
+const lessonGroup = plan2.find((g) => g.kind === "lesson" && g.keep === l2);
+if (!lessonGroup || !lessonGroup.drop.includes(l1)) {
+  console.error("   ✗ 包含关系的两条教训应该被规划合并！");
+  process.exit(1);
+}
+if (plan2.some((g) => g.keep === "scope.check")) {
+  console.error("   ✗ 不同作用域的同名条目不应该被合并！");
+  process.exit(1);
+}
+const applied2 = store.applyConsolidation([lessonGroup]);
+if (applied2.lessons !== 1) {
+  console.error("   ✗ 应该合并 1 组教训！");
+  process.exit(1);
+}
+if (store.getLessons().length !== store.getLessons(true).length - 1) {
+  console.error("   ✗ 有效教训数应比含被取代的少 1！");
+  process.exit(1);
+}
+console.log("   ✓ 教训按包含关系合并，作用域互不越界\n");
+
+// 测试 23: 迁移幂等（老库重复启动不会因为加列失败）
+console.log("23. 测试迁移幂等...");
+const reopened = new MemoryStore(TEST_DB);
+const statsNow = reopened.getStats();
+console.log(
+  `   重新打开: 事实 ${statsNow.semanticCount} (superseded ${statsNow.semanticSuperseded}), 教训 ${statsNow.lessonCount} (superseded ${statsNow.lessonSuperseded})`,
+);
+reopened.close();
+if (statsNow.semanticSuperseded < 1) {
+  console.error("   ✗ 重新打开后整合状态应保留！");
+  process.exit(1);
+}
+console.log("   ✓ 重复迁移与整合状态都保持正常\n");
 
 // 测试完毕，清理测试数据库
 store.close();

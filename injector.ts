@@ -16,7 +16,9 @@
  *
  * 注入策略（2.1.0 起）— 注入层是「索引」，不是全文：
  * - 单条内容过长时压成一行并以 `…` 结尾，全文留在库里用 memory_search 取。
- * - 总长度有上限，但任何分区都不会被静默整块丢弃：装不下只丢尾部，并附 `… (+N more)` 尾注。
+ * - 两级注入（2.2.0 起）：值装不下的条目不再被丢弃，而是退化成 `<key_index>` 里的
+ *   纯键名。键名比「键名 + 值」小一个数量级，所以记忆库增长时覆盖率只缓慢下降。
+ * - 键名也装不下时才截断，并附 `… (+N more keys)` 尾注，绝不静默消失。
  * - 教训有保底预算（lessonReserve），事实再多也挤不掉它。
  * - 分区内按 key 排序，内容不变时注入文本逐字节稳定，便于命中 prompt cache。
  */
@@ -83,10 +85,12 @@ export interface ContextBlock {
     chars: number;
     /** 当前的字符上限 */
     maxChars: number;
-    /** 实际注入的事实条数 */
+    /** 内联了 value 的事实条数 */
     semantic: number;
     /** 参与注入的事实总数 */
     semanticTotal: number;
+    /** 只出现在 <key_index> 里、只有键名没有 value 的事实条数 */
+    keys: number;
     /** 实际注入的教训条数 */
     lessons: number;
     /** 参与注入的教训总数 */
@@ -172,6 +176,49 @@ function lessonText(rule: string, max: number): string {
   return hasMore ? head.replace(/[。；;！!？?]+$/, "") + "…" : head;
 }
 
+/** 针对一些众所周知的前缀提供语义化更友好的分组标签名 */
+const GROUP_NAMES: Record<string, string> = {
+  pref: "preferences",
+  project: "project_context",
+  tool: "tool_preferences",
+  user: "user_identity",
+};
+
+/** 按键名第一个小数点解析出分组标签；没有前缀的归入 general。 */
+function groupTagOf(key: string): string {
+  const dotIdx = key.indexOf(".");
+  const rawPrefix = dotIdx > 0 ? key.slice(0, dotIdx) : "general";
+  return GROUP_NAMES[rawPrefix] || rawPrefix;
+}
+
+/** 渲染一个 XML 分区 */
+function renderSection(tag: string, lines: string[]): string {
+  return `  <${tag}>\n${lines.join("\n")}\n  </${tag}>`;
+}
+
+/** <key_index> 的折行宽度：一行太长不好读，也不影响体积 */
+const KEY_LINE_WIDTH = 120;
+
+/** 把一个分组的纯键名折成若干行，尽量少占用字符（逗号 + 空格，不加前缀符号）。 */
+function wrapKeys(tag: string, keys: string[]): string[] {
+  const indent = "    ";
+  const lines: string[] = [];
+  let current = `${indent}${tag}: `;
+  let first = true;
+  for (const key of keys) {
+    const piece = first ? key : `, ${key}`;
+    if (current.length + piece.length > KEY_LINE_WIDTH && !first) {
+      lines.push(current);
+      current = `${indent}  ${key}`;
+    } else {
+      current += piece;
+    }
+    first = false;
+  }
+  lines.push(current);
+  return lines;
+}
+
 /**
  * 构建完整的记忆上下文块，用于在系统提示词前进行被动注入。
  *
@@ -207,6 +254,7 @@ export function buildContextBlock(
       maxChars: cfg.maxChars,
       semantic: 0,
       semanticTotal: allEntries.length,
+      keys: 0,
       lessons: 0,
       lessonsTotal: lessons.length,
       truncated: [],
@@ -218,18 +266,8 @@ export function buildContextBlock(
   // ── 通过键名的第一个小数点进行动态分组 ──────────────
   const groupMap = new Map<string, SemanticEntry[]>();
 
-  /** 针对一些众所周知的前缀提供语义化更友好的分组标签名 */
-  const groupNames: Record<string, string> = {
-    pref: "preferences",
-    project: "project_context",
-    tool: "tool_preferences",
-    user: "user_identity",
-  };
-
   for (const entry of allEntries) {
-    const dotIdx = entry.key.indexOf(".");
-    const rawPrefix = dotIdx > 0 ? entry.key.slice(0, dotIdx) : "general";
-    const groupKey = groupNames[rawPrefix] || rawPrefix;
+    const groupKey = groupTagOf(entry.key);
     const arr = groupMap.get(groupKey);
     if (arr) arr.push(entry);
     else groupMap.set(groupKey, [entry]);
@@ -240,42 +278,13 @@ export function buildContextBlock(
     arr.sort((a, b) => a.key.localeCompare(b.key));
   }
 
-  const factLines = (entries: SemanticEntry[]): string[] =>
-    entries.map((e) => `    - ${humanizeKey(e.key)}: ${clip(e.value, cfg.factLineMax)}`);
+  const factLine = (e: SemanticEntry): string =>
+    `    - ${humanizeKey(e.key)}: ${clip(e.value, cfg.factLineMax)}`;
 
   const lessonLines = lessons.map((l: LessonEntry) => {
     const prefix = l.negative ? "[AVOID]" : "[DO]";
     return `    ${prefix} ${lessonText(l.rule, cfg.lessonLineMax)}`;
   });
-
-  const render = (tag: string, lines: string[]): string =>
-    `  <${tag}>\n${lines.join("\n")}\n  </${tag}>`;
-
-  /**
-   * 把一个分区放进预算里：装得下就整块放，装不下就只放前缀并附 `… (+N more)` 尾注。
-   * 返回 null 表示连一条都放不下（调用方记为整区丢失）。
-   */
-  const admit = (
-    tag: string,
-    lines: string[],
-    used: number,
-    budget: number,
-  ): { text: string; count: number; dropped: number } | null => {
-    if (lines.length === 0) return null;
-    const full = render(tag, lines);
-    if (used + full.length <= budget) {
-      return { text: full, count: lines.length, dropped: 0 };
-    }
-    for (let n = lines.length - 1; n >= 0; n--) {
-      const dropped = lines.length - n;
-      const text = render(tag, [
-        ...lines.slice(0, n),
-        `    … (+${dropped} more — memory_search)`,
-      ]);
-      if (used + text.length <= budget) return { text, count: n, dropped };
-    }
-    return null;
-  };
 
   // 优先级顺序：保证这些重要的内置分组优先拿到预算
   const priorityOrder = [
@@ -284,25 +293,29 @@ export function buildContextBlock(
     "tool_preferences",
     "user_identity",
   ];
-  const priority: Array<{ tag: string; lines: string[] }> = [];
+  const priority: Array<{ tag: string; entries: SemanticEntry[] }> = [];
   for (const key of priorityOrder) {
     const entries = groupMap.get(key);
     if (entries) {
-      priority.push({ tag: key, lines: factLines(entries) });
+      priority.push({ tag: key, entries });
       groupMap.delete(key);
     }
   }
 
   // 剩余的其他动态分组按首字母升序排序
-  const rest: Array<{ tag: string; lines: string[] }> = Array.from(groupMap.keys())
+  const rest: Array<{ tag: string; entries: SemanticEntry[] }> = Array.from(
+    groupMap.keys(),
+  )
     .sort()
-    .map((key) => ({ tag: key, lines: factLines(groupMap.get(key)!) }));
+    .map((key) => ({ tag: key, entries: groupMap.get(key)! }));
 
   // ── 预算分配：先保住教训的保底份额，再让事实用剩下的 ──────────────
-  const sectionLen = (s: { tag: string; lines: string[] }): number =>
-    render(s.tag, s.lines).length + 1; // +1 是 sections.join("\n") 的分隔符
+  const sectionLen = (s: { tag: string; entries: SemanticEntry[] }): number =>
+    renderSection(s.tag, s.entries.map(factLine)).length + 1; // +1 是 sections.join("\n") 的分隔符
   const factsFull = [...priority, ...rest].reduce((n, s) => n + sectionLen(s), 0);
-  const lessonsFull = lessonLines.length ? render("lessons", lessonLines).length + 1 : 0;
+  const lessonsFull = lessonLines.length
+    ? renderSection("lessons", lessonLines).length + 1
+    : 0;
 
   const fitsAll = factsFull + lessonsFull <= bodyBudget;
   const lessonBudget = fitsAll
@@ -315,19 +328,35 @@ export function buildContextBlock(
         ),
       );
 
-  const sections: string[] = [];
   const truncated: Array<{ section: string; dropped: number }> = [];
-  let used = 0;
-  let semanticCount = 0;
   let lessonCount = 0;
   let lessonSection: string | null = null;
+  let lessonsUsed = 0;
 
   if (lessonLines.length > 0) {
-    const admitted = admit("lessons", lessonLines, 0, lessonBudget);
+    // 教训是一行一条的短规则，长度稳定，保持原有的「整段放 + 尾部截断」策略
+    const full = renderSection("lessons", lessonLines);
+    let admitted: { text: string; count: number; dropped: number } | null = null;
+    if (full.length <= lessonBudget) {
+      admitted = { text: full, count: lessonLines.length, dropped: 0 };
+    } else {
+      for (let n = lessonLines.length - 1; n >= 0; n--) {
+        const dropped = lessonLines.length - n;
+        const text = renderSection("lessons", [
+          ...lessonLines.slice(0, n),
+          `    … (+${dropped} more — memory_search)`,
+        ]);
+        if (text.length <= lessonBudget) {
+          admitted = { text, count: n, dropped };
+          break;
+        }
+      }
+    }
+
     if (admitted) {
       lessonSection = admitted.text;
       lessonCount = admitted.count;
-      used += admitted.text.length + 1;
+      lessonsUsed = admitted.text.length + 1;
       if (admitted.dropped > 0) {
         truncated.push({ section: "lessons", dropped: admitted.dropped });
       }
@@ -336,23 +365,114 @@ export function buildContextBlock(
     }
   }
 
-  const take = (s: { tag: string; lines: string[] }): void => {
-    const admitted = admit(s.tag, s.lines, used, bodyBudget);
-    if (!admitted) {
-      truncated.push({ section: s.tag, dropped: s.lines.length });
-      return;
+  // ── 事实的两级分配 ──────────────────────────────────────────────
+  // 注入顺序：优先级分区在前，其余按字母序；分区内已按 key 排序。
+  // 「带值」和「只留键名」共用同一份预算：带值一条 ~150+ 字符，只留键名一条 ~20 字符。
+  // 所以在「前 k 条带值、其余留键名」上二分，取预算允许的最大 k ——
+  // 结果是宁可少带几条的值，也要让每个条目至少留下键名。
+  const PRIORITY_TAGS = new Set(priorityOrder);
+  const ordered: Array<{ tag: string; entry: SemanticEntry }> = [];
+  for (const s of priority) {
+    for (const e of s.entries) ordered.push({ tag: s.tag, entry: e });
+  }
+  for (const s of rest) {
+    for (const e of s.entries) ordered.push({ tag: s.tag, entry: e });
+  }
+
+  /** 前 k 条带值、其余只留键名时的完整渲染结果 */
+  const layoutAt = (k: number) => {
+    const buckets = new Map<
+      string,
+      { tag: string; values: SemanticEntry[]; keys: string[] }
+    >();
+    for (let i = 0; i < ordered.length; i++) {
+      const item = ordered[i]!;
+      let bucket = buckets.get(item.tag);
+      if (!bucket) {
+        bucket = { tag: item.tag, values: [], keys: [] };
+        buckets.set(item.tag, bucket);
+      }
+      if (i < k) bucket.values.push(item.entry);
+      else bucket.keys.push(item.entry.key);
     }
-    sections.push(admitted.text);
-    used += admitted.text.length + 1;
-    semanticCount += admitted.count;
-    if (admitted.dropped > 0) {
-      truncated.push({ section: s.tag, dropped: admitted.dropped });
+
+    const priorityParts: string[] = [];
+    const restParts: string[] = [];
+    const groups: Array<{ tag: string; keys: string[] }> = [];
+    let semantic = 0;
+    let keys = 0;
+
+    for (const bucket of buckets.values()) {
+      if (bucket.values.length > 0) {
+        const text = renderSection(bucket.tag, bucket.values.map(factLine));
+        if (PRIORITY_TAGS.has(bucket.tag)) priorityParts.push(text);
+        else restParts.push(text);
+        semantic += bucket.values.length;
+      }
+      if (bucket.keys.length > 0) {
+        groups.push({ tag: bucket.tag, keys: bucket.keys });
+        keys += bucket.keys.length;
+      }
     }
+
+    const indexText =
+      groups.length > 0
+        ? renderSection(
+            "key_index",
+            groups.flatMap((g) => wrapKeys(g.tag, g.keys)),
+          )
+        : "";
+    const length = [...priorityParts, ...restParts, indexText]
+      .filter(Boolean)
+      .join("\n").length;
+
+    return { priorityParts, restParts, indexText, semantic, keys, length };
   };
 
-  for (const s of priority) take(s);
-  if (lessonSection) sections.push(lessonSection);
-  for (const s of rest) take(s);
+  const factsBudget = Math.max(0, bodyBudget - lessonsUsed);
+  let lo = 0;
+  let hi = ordered.length;
+  let bestK = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (layoutAt(mid).length <= factsBudget) {
+      bestK = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+
+  let layout = layoutAt(bestK);
+  if (layout.length > factsBudget) {
+    // 连键名都装不下：至少留一行交代丢了多少条，而不是静默消失
+    const trailer = renderSection("key_index", [
+      `    … (+${ordered.length} more keys — memory_list)`,
+    ]);
+    const fits = trailer.length <= factsBudget;
+    layout = {
+      priorityParts: [],
+      restParts: [],
+      indexText: fits ? trailer : "",
+      semantic: 0,
+      keys: 0,
+      length: fits ? trailer.length : 0,
+    };
+  }
+
+  const semanticCount = layout.semantic;
+  const keyCount = layout.keys;
+  const droppedKeys = ordered.length - layout.semantic - layout.keys;
+  if (droppedKeys > 0) {
+    truncated.push({ section: "key_index", dropped: droppedKeys });
+  }
+
+  const sections = [
+    ...layout.priorityParts,
+    ...(lessonSection ? [lessonSection] : []),
+    ...layout.restParts,
+    ...(layout.indexText ? [layout.indexText] : []),
+  ];
 
   if (sections.length === 0) return empty();
 
@@ -364,6 +484,7 @@ export function buildContextBlock(
       maxChars: cfg.maxChars,
       semantic: semanticCount,
       semanticTotal: allEntries.length,
+      keys: keyCount,
       lessons: lessonCount,
       lessonsTotal: lessons.length,
       truncated,

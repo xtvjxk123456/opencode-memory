@@ -36,6 +36,8 @@ export interface SemanticEntry {
    * 如果是全局记忆则该值为 null。
    */
   project: string | null;
+  /** 被哪条记录取代（整合后的指向）；null 表示仍是有效记录 */
+  superseded_by: string | null;
 }
 
 export interface LessonEntry {
@@ -53,6 +55,8 @@ export interface LessonEntry {
   created_at: string;
   /** 该教训提取时所在的项目标识，全局教训则为 null */
   project: string | null;
+  /** 被哪条教训取代（整合后的指向）；null 表示仍是有效记录 */
+  superseded_by: string | null;
 }
 
 export interface MemoryEvent {
@@ -71,12 +75,33 @@ export interface MemoryEvent {
 }
 
 export interface MemoryStats {
-  /** 事实记忆总数 */
+  /** 事实记忆总数（含已被取代的） */
   semanticCount: number;
-  /** 经验教训总数 */
+  /** 经验教训总数（含已被取代的） */
   lessonCount: number;
   /** 事件日志总数 */
   eventCount: number;
+  /** 已被整合取代的事实条数（不参与注入） */
+  semanticSuperseded: number;
+  /** 已被整合取代的教训条数（不参与注入） */
+  lessonSuperseded: number;
+}
+
+/** 一次整合动作：保留 keep，把 drop 合并进来 */
+export interface ConsolidationGroup {
+  kind: "fact" | "lesson";
+  /** 保留条目的标识：facts 用 key，lessons 用 id */
+  keep: string;
+  /** 保留条目的原内容（facts 是 value，lessons 是 rule），便于报告与留档 */
+  keep_text: string;
+  /** 被并掉的条目标识 */
+  drop: string[];
+  /** 合并后的内容；与 keep_text 相同说明对方没有带来新信息 */
+  merged: string;
+  /** 组内最高相似度（0-1），便于人工判断这次合并该不该做 */
+  similarity: number;
+  /** 作用域：facts 用它定位到具体那一行（全局 vs 某个项目） */
+  scope: string | null;
 }
 
 // ─── 杰卡德相似度 (Jaccard Similarity) 算法 ──────────────────────────────────────────────
@@ -137,6 +162,115 @@ function jaccardSimilarity(a: string, b: string): number {
 const HAS_CJK =
   /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
+// ─── 整合 (Consolidation) 判定辅助 ──────────────────────────────────────────────
+
+/** 自动整合默认阈值：只合并高度重复的条目，误合并的风险优先于覆盖率 */
+export const DEFAULT_CONSOLIDATION_THRESHOLD = 0.9;
+
+/** 合并后单条内容的上限：避免把一堆条目拼成一篇长文 */
+const MERGE_MAX_CHARS = 600;
+
+/** 包含关系判定的最小长度：太短的值（"中文"）包含匹配没有意义 */
+const CONTAIN_MIN_CHARS = 12;
+
+/** 归一化后用于比较：小写 + 折叠空白 */
+function normalizeForCompare(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * 两条记忆是否在讲同一件事。
+ *
+ * 判定分两种口径：
+ * - 事实（allowSimilarity=false）：只认「完全相同」和「一条是另一条的可靠子串」。
+ *   两条高相似但各自带不同标识的条目（如 per-module 笔记只差一个编号）不是重复，
+ *   用 Jaccard 合并它们就是误合并 —— 宁可漏掉，也不猜。
+ * - 教训（allowSimilarity=true）：规则是散文，内容值得比较，允许 Jaccard 达阈值。
+ */
+function isSameMemory(
+  a: string,
+  b: string,
+  threshold: number,
+  allowSimilarity: boolean,
+): boolean {
+  const na = normalizeForCompare(a);
+  const nb = normalizeForCompare(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+
+  const [shorter, longer] = na.length <= nb.length ? [na, nb] : [nb, na];
+  if (shorter.length >= CONTAIN_MIN_CHARS && longer.includes(shorter)) return true;
+
+  return allowSimilarity && jaccardSimilarity(na, nb) >= threshold;
+}
+
+/** 按句读切成片段，用于「只补进对方独有的信息」 */
+function splitFragments(text: string): string[] {
+  return text
+    .split(/[。；;!?！？\n]+/)
+    .map((s) => s.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+}
+
+/**
+ * 合并内容：保留 base 的表述，只追加 extras 里「base 没有的片段」。
+ * 判定新片段是否已有：子串包含，或与任一已有片段 Jaccard >= 0.75。
+ * 这样相近的两条不会简单拼接成重复啰嗦的一段。
+ */
+function mergeTexts(base: string, extras: string[]): string {
+  const kept = splitFragments(base);
+  const originalCount = kept.length;
+  for (const extra of extras) {
+    for (const fragment of splitFragments(extra)) {
+      const current = kept.join("；");
+      if (current.includes(fragment)) continue;
+      if (kept.some((k) => jaccardSimilarity(k, fragment) >= 0.75)) continue;
+      if (current.length + fragment.length > MERGE_MAX_CHARS) {
+        return kept.length === originalCount ? base : kept.join("；");
+      }
+      kept.push(fragment);
+    }
+  }
+  // 没有新增内容时原样返回，避免只因为标点归一化就改写用户的表述
+  return kept.length === originalCount ? base : kept.join("；");
+}
+
+/** 组内任意两对的最高相似度，给人看「这次合并有多激进」 */
+function maxPairSimilarity(texts: string[]): number {
+  let max = 0;
+  for (let i = 0; i < texts.length; i++) {
+    for (let j = i + 1; j < texts.length; j++) {
+      const a = normalizeForCompare(texts[i]!);
+      const b = normalizeForCompare(texts[j]!);
+      const score =
+        a === b || a.includes(b) || b.includes(a) ? 1 : jaccardSimilarity(a, b);
+      if (score > max) max = score;
+    }
+  }
+  return Math.round(max * 100) / 100;
+}
+
+/** 事实的保留条目：置信度高 > 内容更长（信息更多）> 新近 > 键名，保证结果稳定 */
+function pickFactCanonical(cluster: SemanticEntry[]): SemanticEntry {
+  return [...cluster].sort(
+    (a, b) =>
+      b.confidence - a.confidence ||
+      b.value.length - a.value.length ||
+      b.updated_at.localeCompare(a.updated_at) ||
+      a.key.localeCompare(b.key),
+  )[0]!;
+}
+
+/** 教训的保留条目：规则最长（信息最多）> 最早创建 > id，保证结果稳定 */
+function pickLessonCanonical(cluster: LessonEntry[]): LessonEntry {
+  return [...cluster].sort(
+    (a, b) =>
+      b.rule.length - a.rule.length ||
+      a.created_at.localeCompare(b.created_at) ||
+      a.id.localeCompare(b.id),
+  )[0]!;
+}
+
 // ─── 数据库存储类 (Store) ───────────────────────────────────────────────────────────
 
 export class MemoryStore {
@@ -194,6 +328,25 @@ export class MemoryStore {
       );
     `);
 
+    // ── v2.3.0 迁移：整合（consolidation）相关 ──────────────────────
+    // 加列必须幂等：老库重复启动时不能再 ALTER 一次（会报 duplicate column）
+    this.addColumnIfMissing("semantic", "superseded_by", "TEXT");
+    this.addColumnIfMissing("lessons", "superseded_by", "TEXT");
+
+    // 覆盖写之前把旧值留档：否则 upsert 就是永久丢信息
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS semantic_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'user',
+        project TEXT,
+        replaced_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_semantic_history_key
+        ON semantic_history(key, replaced_at DESC);
+    `);
+
     // 创建用于全文搜索的 FTS5 虚拟表及触发器 (bun:sqlite 的部分环境可能不支持)
     try {
       this.db.exec(`
@@ -249,6 +402,15 @@ export class MemoryStore {
     }
   }
 
+  /** 幂等地补一列（老库升级用）：已存在就不动，避免 ALTER 报 duplicate column */
+  private addColumnIfMissing(table: string, column: string, type: string): void {
+    const cols = this.db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all() as Array<{ name: string }>;
+    if (cols.some((c) => c.name === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
+
   // ─── 事实记忆 (Semantic Memory) 操作 ─────────────────────────────────────────────
 
   /**
@@ -275,10 +437,10 @@ export class MemoryStore {
         if (!sanitized) return this.searchSemanticFallback(query, limit);
 
         const stmt = this.db.prepare(`
-          SELECT s.key, s.value, s.confidence, s.source, s.created_at, s.updated_at, s.last_accessed
+          SELECT s.key, s.value, s.confidence, s.source, s.created_at, s.updated_at, s.last_accessed, s.project, s.superseded_by
           FROM semantic s
           JOIN semantic_fts f ON s.rowid = f.rowid
-          WHERE semantic_fts MATCH ?
+          WHERE semantic_fts MATCH ? AND s.superseded_by IS NULL
           ORDER BY rank
           LIMIT ?
         `);
@@ -324,9 +486,9 @@ export class MemoryStore {
     params.push(limit);
 
     const stmt = this.db.prepare(`
-      SELECT key, value, confidence, source, created_at, updated_at, last_accessed
+      SELECT key, value, confidence, source, created_at, updated_at, last_accessed, project, superseded_by
       FROM semantic
-      WHERE ${conditions}
+      WHERE superseded_by IS NULL AND (${conditions})
       ORDER BY updated_at DESC
       LIMIT ?
     `);
@@ -363,67 +525,87 @@ export class MemoryStore {
   ): void {
     // SQLite 中的 UNIQUE(key, project) 将 NULL 视为彼此不同，
     // 因此我们需要分别针对 全局作用域 (project IS NULL) 和 局部作用域 进行不同的插入与更新处理。
-    if (project === null) {
-      const stmt = this.db.prepare(`
-        INSERT INTO semantic (key, value, confidence, source, project, created_at, updated_at)
-        VALUES (?, ?, ?, ?, NULL, datetime('now'), datetime('now'))
-        ON CONFLICT(key, project) DO UPDATE SET
-          value = excluded.value,
-          confidence = excluded.confidence,
-          source = excluded.source,
-          updated_at = datetime('now')
-      `);
-      // 由于 SQLite 的 UNIQUE 会将 NULL != NULL，我们需要对全局记录提供降级处理
-      // 策略：先尝试进行更新操作，如果不存在则进行插入
-      const existing = this.db
-        .prepare(`SELECT 1 FROM semantic WHERE key = ? AND project IS NULL`)
-        .get(key);
-      if (existing) {
-        this.db
-          .prepare(
-            `
-          UPDATE semantic SET value = ?, confidence = ?, source = ?, updated_at = datetime('now')
-          WHERE key = ? AND project IS NULL
-        `,
-          )
-          .run(value, confidence, source, key);
-      } else {
-        this.db
-          .prepare(
-            `
-          INSERT INTO semantic (key, value, confidence, source, project, created_at, updated_at)
-          VALUES (?, ?, ?, ?, NULL, datetime('now'), datetime('now'))
-        `,
-          )
-          .run(key, value, confidence, source);
+    const where =
+      project === null ? `key = ? AND project IS NULL` : `key = ? AND project = ?`;
+    const whereParams: (string | null)[] = project === null ? [key] : [key, project];
+
+    const existing = this.db
+      .prepare(`SELECT value, source FROM semantic WHERE ${where}`)
+      .get(...whereParams) as { value: string; source: string } | null;
+
+    if (existing) {
+      // 覆盖写等于永久丢掉旧值，所以先把旧值留档（只追加，不参与检索和注入）
+      if (existing.value !== value) {
+        this.recordHistory(key, existing.value, existing.source, project);
       }
+      this.db
+        .prepare(
+          `
+        UPDATE semantic SET value = ?, confidence = ?, source = ?, updated_at = datetime('now'),
+          superseded_by = NULL
+        WHERE ${where}
+      `,
+        )
+        .run(value, confidence, source, ...whereParams);
     } else {
-      const existing = this.db
-        .prepare(`SELECT 1 FROM semantic WHERE key = ? AND project = ?`)
-        .get(key, project);
-      if (existing) {
-        this.db
-          .prepare(
-            `
-          UPDATE semantic SET value = ?, confidence = ?, source = ?, updated_at = datetime('now')
-          WHERE key = ? AND project = ?
-        `,
-          )
-          .run(value, confidence, source, key, project);
-      } else {
-        this.db
-          .prepare(
-            `
-          INSERT INTO semantic (key, value, confidence, source, project, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-        `,
-          )
-          .run(key, value, confidence, source, project);
-      }
+      this.db
+        .prepare(
+          `
+        INSERT INTO semantic (key, value, confidence, source, project, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      `,
+        )
+        .run(key, value, confidence, source, project);
     }
 
     const scope = project ? `[project: ${project}]` : "[global]";
     this.logEvent("upsert", "semantic", key, `${scope} ${value}`);
+  }
+
+  /**
+   * 把被覆盖掉的旧值留档（只追加，不参与检索与注入）。
+   * 留档失败不影响主流程 —— 记忆写入本身比审计更重要。
+   */
+  private recordHistory(
+    key: string,
+    value: string,
+    source: string,
+    project: string | null,
+  ): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO semantic_history (key, value, source, project) VALUES (?, ?, ?, ?)`,
+        )
+        .run(key, value, source, project);
+    } catch {
+      // 忽略留档失败
+    }
+  }
+
+  /**
+   * 读取某条事实被覆盖前的历史值（最新的在前）。
+   *
+   * @param key 键名
+   * @param limit 最多返回多少条 (默认 10)
+   */
+  getSemanticHistory(
+    key: string,
+    limit: number = 10,
+  ): Array<{ value: string; source: string; project: string | null; replaced_at: string }> {
+    const stmt = this.db.prepare(`
+      SELECT value, source, project, replaced_at
+      FROM semantic_history
+      WHERE key = ?
+      ORDER BY replaced_at DESC, id DESC
+      LIMIT ?
+    `);
+    return stmt.all(key, limit) as Array<{
+      value: string;
+      source: string;
+      project: string | null;
+      replaced_at: string;
+    }>;
   }
 
   /**
@@ -461,29 +643,31 @@ export class MemoryStore {
    * 根据项目作用域提取所有事实记忆记录。
    * 该方法会返回 全局记录 (project IS NULL) 加上对应 projectId 的项目私有记录。
    * 如果存在相同 key 的情况，项目私有的记录会覆盖掉全局记录 (去重)。
+   * 默认只返回有效记录（未被整合取代的）。
    *
    * @param projectId 项目唯一标识 (可选)
+   * @param includeSuperseded 是否包含已被整合取代的记录 (默认 false)
    * @returns 合并去重后的所有事实记忆记录数组
    */
-  getAllSemantic(projectId?: string | null): SemanticEntry[] {
-    let rows: SemanticEntry[];
-    if (projectId) {
-      // 获取 全局 + 当前项目 的记录
-      const stmt = this.db.prepare(`
-        SELECT key, value, confidence, source, created_at, updated_at, last_accessed, project
-        FROM semantic
-        WHERE project IS NULL OR project = ?
-        ORDER BY updated_at DESC
-      `);
-      rows = stmt.all(projectId) as SemanticEntry[];
-    } else {
-      const stmt = this.db.prepare(`
-        SELECT key, value, confidence, source, created_at, updated_at, last_accessed, project
-        FROM semantic
-        ORDER BY updated_at DESC
-      `);
-      rows = stmt.all() as SemanticEntry[];
-    }
+  getAllSemantic(
+    projectId?: string | null,
+    includeSuperseded: boolean = false,
+  ): SemanticEntry[] {
+    const where = includeSuperseded
+      ? projectId
+        ? `(project IS NULL OR project = ?)`
+        : `1`
+      : projectId
+        ? `superseded_by IS NULL AND (project IS NULL OR project = ?)`
+        : `superseded_by IS NULL`;
+
+    const stmt = this.db.prepare(`
+      SELECT key, value, confidence, source, created_at, updated_at, last_accessed, project, superseded_by
+      FROM semantic
+      WHERE ${where}
+      ORDER BY updated_at DESC
+    `);
+    const rows = (projectId ? stmt.all(projectId) : stmt.all()) as SemanticEntry[];
 
     // 去重逻辑：对于同一个 key，带有 project 的局部记录优先级高于全局记录
     if (projectId) {
@@ -516,13 +700,77 @@ export class MemoryStore {
    */
   getSemanticByPrefix(prefix: string, limit: number = 50): SemanticEntry[] {
     const stmt = this.db.prepare(`
-      SELECT key, value, confidence, source, created_at, updated_at, last_accessed, project
+      SELECT key, value, confidence, source, created_at, updated_at, last_accessed, project, superseded_by
       FROM semantic
       WHERE key LIKE ?
       ORDER BY updated_at DESC
       LIMIT ?
     `);
     return stmt.all(`${prefix}%`, limit) as SemanticEntry[];
+  }
+
+  /**
+   * 按键名精确取回记录，包含全局与各项目作用域的版本。
+   * 用于 `memory_get`：注入层只给出 `<key_index>` 键名时，靠它拿回全文。
+   *
+   * @param key 记忆的键名
+   * @returns 该键名下的所有记录（项目级排在前，便于看到覆盖最具体的那条）
+   */
+  getSemanticByKey(key: string): SemanticEntry[] {
+    const stmt = this.db.prepare(`
+      SELECT key, value, confidence, source, created_at, updated_at, last_accessed, project, superseded_by
+      FROM semantic
+      WHERE key = ?
+      ORDER BY superseded_by IS NULL DESC, project IS NULL, project
+    `);
+    const rows = stmt.all(key) as SemanticEntry[];
+
+    if (rows.length > 0) {
+      this.db
+        .prepare(`UPDATE semantic SET last_accessed = datetime('now') WHERE key = ?`)
+        .run(key);
+    }
+    return rows;
+  }
+
+  /**
+   * 按项目作用域分页列出事实记忆，按 key 排序（顺序稳定，便于 offset 翻页）。
+   * 用于 `memory_list`：不依赖关键词命中，可以确定性地把某个分类翻完。
+   *
+   * @param prefix 键名前缀（"pref" / "pref." / "tool.bulk_" 都可）；空串表示全部
+   * @param offset 跳过多少条
+   * @param limit 最多返回多少条
+   * @param projectId 当前项目标识（返回 全局 + 该项目 的合并去重视图）
+   * @param includeSuperseded 是否包含已被整合取代的记录 (默认 false)
+   * @returns 本页记录与符合前缀的总条数
+   */
+  listSemanticPage(
+    prefix: string,
+    offset: number,
+    limit: number,
+    projectId?: string | null,
+    includeSuperseded: boolean = false,
+  ): { entries: SemanticEntry[]; total: number } {
+    const p = prefix.trim();
+    /** "pref" 匹配 pref.*，"tool.bulk_" 按字面前缀匹配，"pref.x" 命中自身 */
+    const matches = (key: string): boolean => {
+      if (!p) return true;
+      if (!key.startsWith(p)) return false;
+      return (
+        p.endsWith(".") ||
+        p.endsWith("_") ||
+        key.length === p.length ||
+        key[p.length] === "."
+      );
+    };
+    const all = this.getAllSemantic(projectId ?? null, includeSuperseded)
+      .filter((e) => matches(e.key))
+      .sort((a, b) => a.key.localeCompare(b.key));
+
+    return {
+      entries: all.slice(offset, offset + limit),
+      total: all.length,
+    };
   }
 
   /**
@@ -650,13 +898,14 @@ export class MemoryStore {
   /**
    * 获取所有存活（未被删除）的经验教训记录。
    *
+   * @param includeSuperseded 是否包含已被整合取代的教训 (默认 false)
    * @returns {LessonEntry[]} 所有的经验教训数组
    */
-  getLessons(): LessonEntry[] {
+  getLessons(includeSuperseded: boolean = false): LessonEntry[] {
     const stmt = this.db.prepare(`
-      SELECT id, rule, category, source, negative, created_at, project
+      SELECT id, rule, category, source, negative, created_at, project, superseded_by
       FROM lessons
-      WHERE is_deleted = 0
+      WHERE is_deleted = 0${includeSuperseded ? "" : " AND superseded_by IS NULL"}
       ORDER BY created_at DESC
     `);
     const rows = stmt.all() as Array<
@@ -690,10 +939,10 @@ export class MemoryStore {
         if (!sanitized) return this.searchLessonsFallback(query, limit);
 
         const stmt = this.db.prepare(`
-          SELECT l.id, l.rule, l.category, l.source, l.negative, l.created_at, l.project
+          SELECT l.id, l.rule, l.category, l.source, l.negative, l.created_at, l.project, l.superseded_by
           FROM lessons l
           JOIN lessons_fts f ON l.rowid = f.rowid
-          WHERE lessons_fts MATCH ? AND l.is_deleted = 0
+          WHERE lessons_fts MATCH ? AND l.is_deleted = 0 AND l.superseded_by IS NULL
           ORDER BY rank
           LIMIT ?
         `);
@@ -725,9 +974,9 @@ export class MemoryStore {
     params.push(limit);
 
     const stmt = this.db.prepare(`
-      SELECT id, rule, category, source, negative, created_at, project
+      SELECT id, rule, category, source, negative, created_at, project, superseded_by
       FROM lessons
-      WHERE is_deleted = 0 AND (${conditions})
+      WHERE is_deleted = 0 AND superseded_by IS NULL AND (${conditions})
       ORDER BY created_at DESC
       LIMIT ?
     `);
@@ -781,11 +1030,21 @@ export class MemoryStore {
     const events = this.db
       .prepare(`SELECT COUNT(*) as count FROM events`)
       .get() as { count: number };
+    const supersededFacts = this.db
+      .prepare(`SELECT COUNT(*) as count FROM semantic WHERE superseded_by IS NOT NULL`)
+      .get() as { count: number };
+    const supersededLessons = this.db
+      .prepare(
+        `SELECT COUNT(*) as count FROM lessons WHERE is_deleted = 0 AND superseded_by IS NOT NULL`,
+      )
+      .get() as { count: number };
 
     return {
       semanticCount: semantic.count,
       lessonCount: lessons.count,
       eventCount: events.count,
+      semanticSuperseded: supersededFacts.count,
+      lessonSuperseded: supersededLessons.count,
     };
   }
 
@@ -803,6 +1062,195 @@ export class MemoryStore {
       LIMIT ?
     `);
     return stmt.all(limit) as MemoryEvent[];
+  }
+
+  // ─── 整合 (Consolidation) ───────────────────────────────────────────────────────
+
+  /**
+   * 规划一次整合，不改动数据库（dry run 用）。
+   *
+   * 只在「同前缀 + 同作用域」内比较，且事实与教训用不同口径：
+   * - 事实只合并「完全相同」或「一条包含另一条」的条目。只差一个编号/路径的平行条目
+   *   相似度往往 > 0.9，用相似度合并就是误合并，因此事实不参与相似度猜测。
+   * - 教训是散文，按 threshold 做相似度合并（同类别 + 同方向 + 同作用域内）。
+   * 已被取代的记录不参与下一轮规划，天然幂等。
+   *
+   * @param options.threshold 教训的相似度阈值 (0-1)，默认 DEFAULT_CONSOLIDATION_THRESHOLD
+   * @param options.includeLessons 是否同时规划教训 (默认 true)
+   * @returns 待执行的合并分组；空数组表示没有可整合的条目
+   */
+  planConsolidation(
+    options: { threshold?: number; includeLessons?: boolean } = {},
+  ): ConsolidationGroup[] {
+    const threshold = Math.min(
+      1,
+      Math.max(0.3, options.threshold ?? DEFAULT_CONSOLIDATION_THRESHOLD),
+    );
+    const groups = this.planFactGroups(threshold);
+    if (options.includeLessons !== false) {
+      groups.push(...this.planLessonGroups(threshold));
+    }
+    return groups;
+  }
+
+  private planFactGroups(threshold: number): ConsolidationGroup[] {
+    // 注意：桶内是两两比较（O(n²)）。前缀一般只有几十上百条，启动时跑一次可以接受；
+    // 若某个前缀上千条，整合会明显变慢，此时更适合用 memory_list 人工整理。
+    const buckets = new Map<string, SemanticEntry[]>();
+    for (const row of this.getAllSemantic(null)) {
+      const dot = row.key.indexOf(".");
+      const prefix = dot > 0 ? row.key.slice(0, dot) : row.key;
+      const bucketKey = `${prefix}\u0000${row.project ?? ""}`;
+      const arr = buckets.get(bucketKey);
+      if (arr) arr.push(row);
+      else buckets.set(bucketKey, [row]);
+    }
+
+    const groups: ConsolidationGroup[] = [];
+    for (const items of buckets.values()) {
+      if (items.length < 2) continue;
+      items.sort((a, b) => a.key.localeCompare(b.key));
+
+      const clusters: SemanticEntry[][] = [];
+      for (const item of items) {
+        const cluster = clusters.find((c) =>
+          isSameMemory(c[0]!.value, item.value, threshold, false),
+        );
+        if (cluster) cluster.push(item);
+        else clusters.push([item]);
+      }
+
+      for (const cluster of clusters) {
+        if (cluster.length < 2) continue;
+        const keep = pickFactCanonical(cluster);
+        const drops = cluster.filter((e) => e.key !== keep.key);
+        groups.push({
+          kind: "fact",
+          keep: keep.key,
+          keep_text: keep.value,
+          drop: drops.map((e) => e.key),
+          merged: mergeTexts(
+            keep.value,
+            drops.map((e) => e.value),
+          ),
+          similarity: maxPairSimilarity(cluster.map((e) => e.value)),
+          scope: keep.project,
+        });
+      }
+    }
+    return groups;
+  }
+
+  private planLessonGroups(threshold: number): ConsolidationGroup[] {
+    const buckets = new Map<string, LessonEntry[]>();
+    for (const lesson of this.getLessons()) {
+      // 方向（AVOID/DO）也参与分桶：不能把「该做」并成「别做」
+      const bucketKey = `${lesson.category}\u0000${lesson.negative ? "1" : "0"}\u0000${lesson.project ?? ""}`;
+      const arr = buckets.get(bucketKey);
+      if (arr) arr.push(lesson);
+      else buckets.set(bucketKey, [lesson]);
+    }
+
+    const groups: ConsolidationGroup[] = [];
+    for (const items of buckets.values()) {
+      if (items.length < 2) continue;
+      items.sort((a, b) => a.id.localeCompare(b.id));
+
+      const clusters: LessonEntry[][] = [];
+      for (const item of items) {
+        const cluster = clusters.find((c) =>
+          isSameMemory(c[0]!.rule, item.rule, threshold, true),
+        );
+        if (cluster) cluster.push(item);
+        else clusters.push([item]);
+      }
+
+      for (const cluster of clusters) {
+        if (cluster.length < 2) continue;
+        const keep = pickLessonCanonical(cluster);
+        const drops = cluster.filter((e) => e.id !== keep.id);
+        groups.push({
+          kind: "lesson",
+          keep: keep.id,
+          keep_text: keep.rule,
+          drop: drops.map((e) => e.id),
+          merged: mergeTexts(
+            keep.rule,
+            drops.map((e) => e.rule),
+          ),
+          similarity: maxPairSimilarity(cluster.map((e) => e.rule)),
+          scope: keep.project,
+        });
+      }
+    }
+    return groups;
+  }
+
+  /**
+   * 执行整合：把 drop 标记为「被 keep 取代」，并写入合并后的内容。
+   * 只标记不删除 —— 被取代的记录仍可被 memory_get / memory_list 查到。
+   *
+   * @returns 实际处理的条数
+   */
+  applyConsolidation(groups: ConsolidationGroup[]): {
+    facts: number;
+    lessons: number;
+  } {
+    let facts = 0;
+    let lessons = 0;
+
+    const run = this.db.transaction(() => {
+      const markFact = this.db.prepare(
+        `UPDATE semantic SET superseded_by = ?, updated_at = datetime('now')
+         WHERE key = ? AND project IS ? AND superseded_by IS NULL`,
+      );
+      const rewriteFact = this.db.prepare(
+        `UPDATE semantic SET value = ?, updated_at = datetime('now')
+         WHERE key = ? AND project IS ?`,
+      );
+      const markLesson = this.db.prepare(
+        `UPDATE lessons SET superseded_by = ? WHERE id = ? AND superseded_by IS NULL`,
+      );
+      const rewriteLesson = this.db.prepare(`UPDATE lessons SET rule = ? WHERE id = ?`);
+
+      for (const group of groups) {
+        if (group.drop.length === 0) continue;
+
+        if (group.kind === "fact") {
+          for (const dropKey of group.drop) {
+            markFact.run(group.keep, dropKey, group.scope);
+          }
+          if (group.merged && group.merged !== group.keep_text) {
+            this.recordHistory(group.keep, group.keep_text, "consolidation", group.scope);
+            rewriteFact.run(group.merged, group.keep, group.scope);
+          }
+          this.logEvent(
+            "consolidate",
+            "semantic",
+            group.keep,
+            `merged ${group.drop.join(", ")}`,
+          );
+          facts++;
+        } else {
+          for (const dropId of group.drop) {
+            markLesson.run(group.keep, dropId);
+          }
+          if (group.merged && group.merged !== group.keep_text) {
+            rewriteLesson.run(group.merged, group.keep);
+          }
+          this.logEvent(
+            "consolidate",
+            "lesson",
+            group.keep,
+            `merged ${group.drop.join(", ")}`,
+          );
+          lessons++;
+        }
+      }
+    });
+
+    run();
+    return { facts, lessons };
   }
 
   // ─── 生命周期管理 (Lifecycle) ───────────────────────────────────────────────────

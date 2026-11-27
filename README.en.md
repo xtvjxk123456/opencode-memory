@@ -7,15 +7,20 @@ This extension gives your AI assistant the ability to remember your preferences,
 [中文文档](./README.md)
 
 > **Version note**: `2.0.0` and later target the **OpenCode 2** plugin API (the `1.0.x` line only supports OpenCode 1.x). Both lines share the same SQLite database, so upgrading keeps all memories.
+>
+> **2.2.0**: injection became two-level (values + a `<key_index>` of keys), and `memory_get` / `memory_list` were added for deterministic retrieval.
+>
+> **2.3.0**: memory consolidation — duplicates collapse into one canonical entry, the rest are marked superseded (not deleted); overwrites archive the old value, and `memory_consolidate` is a dry run by default.
 
 > **Fork note**: This is a fork of [songsongtao/opencode-memory](https://github.com/songsongtao/opencode-memory), maintaining the `2.x` (OpenCode 2) line independently. Upstream has been dormant since 2026-06, and the OpenCode 2 port exists only here. Verified against opencode `v2.1.4` + `@opencode/plugin 2.0.26`.
 
 ## Features
 
 - **Persistent Storage** — Uses SQLite to store memories, ensuring they persist across different OpenCode sessions.
-- **4 Built-in Tools** — The AI can search, store, and delete memories automatically or on command.
+- **7 Built-in Tools** — The AI can search, fetch by exact key, page through categories, store, delete, consolidate memories, and inspect statistics.
 - **Auto-Injection** — Injects existing memories into the system prompt on every model request (subagent sessions are skipped to keep their context pure; injection survives compaction).
-- **Indexed Injection** — Long entries collapse to one line and the full text stays in the database for on-demand search; when the budget is exceeded only the tail is dropped, marked with `(+N more)` instead of vanishing whole.
+- **Two-Level Injection** — Entries that fit are injected with their value; the rest degrade to key-only entries in `<key_index>` (about 1/5–1/10 the size of key + value), so a library of hundreds or thousands of entries stays fully discoverable while `memory_get` / `memory_list` fetch the full text.
+- **Consolidation Instead of Deletion** — Duplicates collapse into one canonical entry and the rest are marked superseded: nothing is deleted, everything stays traceable, and injection only faces effective knowledge.
 - **Smart Categorization** — Memories are grouped into preferences (`pref.*`), environment (`env.*`), tools (`tool.*`), and user (`user.*`).
 - **Project Scoping** — Any preference can be global (applies everywhere) or scoped exclusively to the current project.
 - **Intelligent Project Detection** — Uses git remote URLs to identify projects, automatically sharing memory across multiple clones of the same repository.
@@ -77,9 +82,12 @@ npm install -g supereasy-memory
 | Tool | Description |
 |------|-------------|
 | `memory_search` | Search semantic memory by keyword. |
+| `memory_get` | Fetch the full text by exact key (this is how `<key_index>` entries are read; returns both global and project versions). |
+| `memory_list` | Page through facts by key prefix, no keyword needed. |
 | `memory_remember` | Store a fact or lesson (supports `scope` for global vs. project). |
 | `memory_forget` | Delete a specific memory (supports scope deletion). |
-| `memory_stats` | View memory statistics and scope distribution. |
+| `memory_consolidate` | Merge duplicate entries (**dry run by default**; merged entries are marked, not deleted). |
+| `memory_stats` | View memory statistics, effective/superseded counts, and this session's injection report. |
 
 ## Usage Examples
 
@@ -95,6 +103,8 @@ Tell the AI:
 ### Searching & Managing Memory
 - *"Search for my preferences regarding git."*
 - *"What lessons have I recorded about deployment?"*
+- *"List every memory starting with tool."* (the AI pages with `memory_list`, no keyword needed)
+- *"Show me the full text of pref.commit_style."* (the AI calls `memory_get`)
 - *"Show memory stats."*
 - *"Forget pref.commit_style."*
 
@@ -115,13 +125,24 @@ Every memory fact has a scope:
 
 ## Injection Strategy
 
-Before every model request the plugin appends a `<memory>` block to the end of the system prompt. The injected block is an **index**, not the full text:
+Before every model request the plugin appends a `<memory>` block to the end of the system prompt. Injection has two levels, and neither is the full text:
 
-- **One line per long entry** — a fact value over 150 characters, or a lesson over 100 characters (first sentence), is truncated and ends with `…`; the full text stays in the database and the model fetches it with `memory_search`. The block itself explains this.
-- **Nothing is dropped whole** — the block has a character budget (8000 by default). A section that does not fit loses only its tail and gets a `… (+N more — memory_search)` trailer, so `<lessons>` can no longer silently disappear.
+- **Level 1 — values** — entries that fit are injected with their value. A fact value over 150 characters, or a lesson over 100 characters (first sentence), is collapsed to one line ending with `…`; the full text stays in the database.
+- **Level 2 — keys** — the remaining entries degrade to key-only entries in `<key_index>`:
+
+  ```xml
+  <key_index>
+    project_context: project.module_5, project.module_6, project.module_7
+    env: env.bun
+  </key_index>
+  ```
+
+  A key carries meaning on its own. One key costs about 20 characters where a value line costs 150+, so the same budget covers 5–10× more entries. The model reads a key with `memory_get(key)` or pages a whole category with `memory_list(prefix)`.
+- **Trade-off rule** — when the budget is short, the plugin drops value lines first, never entries: fewer details beats losing a memory. With a fixed entry count, the block only grows with the number of keys.
+- **Nothing disappears silently** — only when even the keys do not fit is anything truncated, and then a `… (+N more keys — memory_list)` trailer says how much. `memory_stats` reports values / keys / dropped separately, and the three always add up to the total entry count.
 - **Lessons keep a guaranteed share** — 30% of the budget is reserved by default, so facts cannot starve them.
-- **Cache friendly** — sections are sorted by key, so the injected text is byte-stable while memories do not change and can hit the prompt cache.
-- **Visible** — `memory_stats` reports what the current session injects: characters used, facts/lessons included, and truncated sections.
+- **Cache friendly** — sections are sorted by key, so the injected text is byte-stable while memories do not change and can hit the prompt cache. Adding or editing a memory changes the text, as expected.
+- **Visible** — `memory_stats` reports what the current session injects: characters used, how many entries carry values, how many are keys only, and which sections were truncated.
 
 ### Tuning the budget
 
@@ -132,11 +153,44 @@ Optionally create `~/.config/opencode/supereasy-memory/config.json` (next to the
   "maxChars": 8000,
   "factLineMax": 150,
   "lessonLineMax": 100,
-  "lessonReserve": 0.3
+  "lessonReserve": 0.3,
+  "consolidation": {
+    "auto": true,
+    "threshold": 0.9
+  }
 }
 ```
 
 Missing fields or invalid types fall back to the defaults. The file is read at plugin startup, so restart OpenCode (or trigger a plugin reload) after editing it.
+
+Since the key layer is cheap, raising `maxChars` first fills out key coverage and only then adds more values: even at the 8000 default, hundreds of entries stay visible as keys.
+
+`consolidation.auto: false` disables the startup merge; `consolidation.threshold` only affects how aggressively lessons merge (facts only merge on identity/containment and ignore the threshold).
+
+## Consolidation
+
+The library may grow forever, but injection should only see **effective** knowledge. Consolidation collapses several records of the same thing into one canonical entry and marks the rest superseded (`superseded_by`) — nothing is deleted, everything stays traceable.
+
+**Criteria (prefer missing a merge over a wrong one)**
+
+| Kind | Merged when (same prefix/category and same scope) |
+|---|---|
+| Fact | Content is **identical**, or **one is a substring of the other** (≥ 12 chars) |
+| Lesson | Identical / substring / Jaccard ≥ threshold (same category and same AVOID/DO direction) |
+
+Facts never merge by similarity: parallel entries that differ only by an index or a path (`project.module_1` vs `project.module_2`) often score above 0.9, and merging them would be a false positive.
+
+**When it runs**
+
+- **Automatically at startup**: on by default, threshold 0.9 (conservative). It runs once and does not touch the session.
+- **Manually**: `memory_consolidate`, a **dry run by default** that only prints the plan; call again with `dry_run: false` to apply.
+
+**After merging**
+
+- Merged entries stop feeding injection and `memory_search` but remain readable via `memory_get` / `memory_list({ include_superseded: true })`.
+- The canonical entry picks up fragments unique to the others (split on sentence punctuation, existing content skipped), so merging does not lose content.
+- Overwriting a key with `memory_remember` archives the old value in `semantic_history`; `memory_get` shows them under "Replaced values".
+- `memory_stats` reports effective vs superseded counts, so you can tell whether another tidy-up is worthwhile.
 
 ## Data Storage
 

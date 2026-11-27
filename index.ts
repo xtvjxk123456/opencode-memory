@@ -3,13 +3,16 @@
  *
  * 由 V1 插件 (https://github.com/songsongtao/opencode-memory) 移植到 OpenCode 2 插件 API：
  * - 入口改为 default 导出的 `{ id, setup }` 定义对象（V2 插件协议）。
- * - 4 个工具通过 `ctx.tool.transform` 注册，参数使用 JSON Schema（不再依赖 zod）。
+ * - 7 个工具通过 `ctx.tool.transform` 注册，参数使用 JSON Schema（不再依赖 zod）。
  * - 记忆注入改为 `ctx.session.hook("context")`：在每次模型请求的 system 段注入。
  *   V2 的 hook 修改不会写入会话历史，因此按请求注入；注入内容固定（分区内按 key 排序），
  *   可命中 prompt cache，开销很小；压缩（compaction）后也不会丢失记忆，
  *   故 V1 的 `experimental.session.compacting` 钩子不再需要。
- * - 注入层是「索引」：长条目压成一行，全文留在库里用 memory_search 取；超出字符上限的分区
- *   只丢尾部并附尾注，不会整块消失（详见 injector.ts 与 config.json）。
+ * - 注入层是「索引」：长条目压成一行，全文留在库里用 memory_search 取；值装不下的条目
+ *   退化成 <key_index> 里的纯键名，用 memory_get / memory_list 确定性取回
+ *   （详见 injector.ts 与 config.json）。
+ * - 整合（consolidation）：重复条目收成一条主记录，其余标 superseded_by（不删除），
+ *   注入只面对有效记录；启动时自动跑一次保守整合，也可用 memory_consolidate 手动触发。
  * - 子代理会话（`session.parentID` 非空）跳过注入，保持子代理上下文纯粹。
  * - 存储层 store.ts / 注入器 injector.ts 与 V1 完全一致，继续使用同一个
  *   SQLite 数据库（~/.config/opencode/supereasy-memory/supereasy-memory.db）。
@@ -18,13 +21,12 @@ import type { Plugin } from "@opencode/plugin"; // 仅类型使用，运行时�
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync, existsSync, readFileSync } from "node:fs";
-import { MemoryStore } from "./store.js";
+import { MemoryStore, DEFAULT_CONSOLIDATION_THRESHOLD } from "./store.js";
 import {
   buildContextBlock,
   resolveProjectId,
   projectDisplayName,
   normalizeInjectionConfig,
-  DEFAULT_INJECTION_CONFIG,
   type InjectionConfig,
 } from "./injector.js";
 
@@ -34,18 +36,49 @@ const MEMORY_MARKER = "<!-- supereasy-memory-context -->";
 const CONFIG_DIR = join(homedir(), ".config", "opencode", "supereasy-memory");
 
 /**
- * 读取注入配置（可选）。文件不存在或内容非法时回落到默认值。
+ * 读取配置文件（可选）。文件不存在或内容非法时返回空对象，全部走默认值。
  * 只在插件 setup 时读一次，改完 config.json 需重启 OpenCode（或触发插件重载）才生效。
  */
-function loadInjectionConfig(): InjectionConfig {
+function readConfigFile(): Record<string, unknown> {
   const file = join(CONFIG_DIR, "config.json");
   try {
-    if (!existsSync(file)) return DEFAULT_INJECTION_CONFIG;
-    return normalizeInjectionConfig(JSON.parse(readFileSync(file, "utf8")));
+    if (!existsSync(file)) return {};
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    return parsed && typeof parsed === "object"
+      ? (parsed as Record<string, unknown>)
+      : {};
   } catch (err) {
-    console.warn("[supereasy-memory] config.json 读取失败，使用默认注入配置:", err);
-    return DEFAULT_INJECTION_CONFIG;
+    console.warn("[supereasy-memory] config.json 读取失败，使用默认配置:", err);
+    return {};
   }
+}
+
+/** 整合（consolidation）行为配置 */
+interface ConsolidationConfig {
+  /** 插件启动时自动跑一次整合 */
+  auto: boolean;
+  /** 自动整合的相似度阈值 (0.3-1) */
+  threshold: number;
+}
+
+const DEFAULT_CONSOLIDATION_CONFIG: ConsolidationConfig = {
+  auto: true,
+  threshold: DEFAULT_CONSOLIDATION_THRESHOLD,
+};
+
+/** 校验并补全整合配置；非法值一律回落默认，保证启动不被打断 */
+export function normalizeConsolidationConfig(input: unknown): ConsolidationConfig {
+  const raw = (input && typeof input === "object" ? input : {}) as Record<
+    string,
+    unknown
+  >;
+  const auto =
+    typeof raw.auto === "boolean" ? raw.auto : DEFAULT_CONSOLIDATION_CONFIG.auto;
+  const n = typeof raw.threshold === "number" ? raw.threshold : Number(raw.threshold);
+  const threshold = Number.isFinite(n)
+    ? Math.min(1, Math.max(0.3, n))
+    : DEFAULT_CONSOLIDATION_CONFIG.threshold;
+  return { auto, threshold };
 }
 
 // ─── 数据库单例 ─────────────────────────────────────────────────
@@ -102,6 +135,12 @@ function stripQuotes(v: string): string {
     }
   }
   return v;
+}
+
+/** 压成一行并截断，用于工具返回里的预览 */
+function preview(text: string, max: number = 160): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
 // ─── 工具定义层 ────────────────────────────────────────────────
@@ -178,6 +217,142 @@ function buildTools(
         }
       }
 
+      return { content: parts.join("\n") };
+    },
+  };
+
+  const memoryGet: MemoryTool = {
+    name: "memory_get",
+    description:
+      "Fetch the full text of a stored fact by its exact key. Use this for any key listed in <key_index> (values are omitted there because of the injection budget), or when you already know the key and a keyword search would be noisy. Returns both the global and the project-scoped version when they exist.",
+    options: direct,
+    input: {
+      type: "object",
+      properties: {
+        key: {
+          type: "string",
+          description: "Exact memory key, e.g. pref.commit_style",
+        },
+      },
+      required: ["key"],
+      additionalProperties: false,
+    },
+    async execute(rawInput) {
+      const args = (rawInput ?? {}) as { key?: string };
+      const key = stripQuotes(String(args.key ?? "")).trim();
+      if (!key) return { content: 'Error: "key" is required.' };
+
+      const s = getStore();
+      const rows = s.getSemanticByKey(key);
+      if (rows.length === 0) {
+        return {
+          content: `No memory found for key "${key}". Try memory_list with a prefix, or memory_search with a keyword.`,
+        };
+      }
+
+      const parts = rows.map((r) => {
+        const scope = r.project ? `[project: ${r.project}]` : "[global]";
+        const state = r.superseded_by
+          ? ` [superseded by ${r.superseded_by} — kept for reference]`
+          : "";
+        return `- **${r.key}** ${scope}${state} (confidence ${r.confidence}, updated ${r.updated_at})\n${r.value}`;
+      });
+
+      // 覆盖写留下的旧值（只追加的历史），让「改过什么」也可回溯
+      const history = s.getSemanticHistory(key, 5);
+      if (history.length > 0) {
+        parts.push(
+          "### Replaced values (newest first)\n" +
+            history
+              .map((h) => {
+                const value = h.value.length > 300 ? `${h.value.slice(0, 300)}…` : h.value;
+                return `- [${h.replaced_at}] ${value}`;
+              })
+              .join("\n"),
+        );
+      }
+
+      return { content: parts.join("\n\n") };
+    },
+  };
+
+  const memoryList: MemoryTool = {
+    name: "memory_list",
+    description:
+      "Page through stored facts in key order, without needing a keyword. Use it to browse one category by prefix (e.g. \"pref\", \"tool.\", \"project.build\") or to enumerate what exists when memory_search misses. Full values are returned, 20 per page; pass offset to continue.",
+    options: direct,
+    input: {
+      type: "object",
+      properties: {
+        prefix: {
+          type: "string",
+          description:
+            'Key prefix to filter by, e.g. "pref" or "tool.bulk_". Omit to list everything.',
+        },
+        offset: {
+          type: "number",
+          description: "How many matching facts to skip (default: 0)",
+        },
+        limit: {
+          type: "number",
+          description: "How many facts to return, 1-100 (default: 20)",
+        },
+        include_superseded: {
+          type: "boolean",
+          description:
+            "Also list entries that consolidation replaced (marked [superseded]). Default false.",
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(rawInput) {
+      const args = (rawInput ?? {}) as {
+        prefix?: string;
+        offset?: number;
+        limit?: number;
+        include_superseded?: boolean;
+      };
+      const prefix = stripQuotes(String(args.prefix ?? "")).trim();
+      const clamp = (value: unknown, fallback: number, min: number, max: number): number => {
+        const n = typeof value === "number" ? value : Number(value);
+        if (!Number.isFinite(n)) return fallback;
+        return Math.min(max, Math.max(min, Math.floor(n)));
+      };
+      const offset = clamp(args.offset, 0, 0, 1_000_000);
+      const limit = clamp(args.limit, 20, 1, 100);
+
+      const { entries, total } = getStore().listSemanticPage(
+        prefix,
+        offset,
+        limit,
+        projectId,
+        args.include_superseded === true,
+      );
+      if (total === 0) {
+        return {
+          content: `No facts found${prefix ? ` with prefix "${prefix}"` : ""}.`,
+        };
+      }
+      if (entries.length === 0) {
+        return {
+          content: `Offset ${offset} is past the end: ${total} facts found${prefix ? ` with prefix "${prefix}"` : ""}.`,
+        };
+      }
+
+      const parts = [
+        `Showing ${offset + 1}-${offset + entries.length} of ${total} facts${prefix ? ` with prefix "${prefix}"` : ""}.`,
+      ];
+      for (const entry of entries) {
+        const scope = entry.project ? `[project: ${entry.project}]` : "[global]";
+        const state = entry.superseded_by ? ` [superseded by ${entry.superseded_by}]` : "";
+        parts.push(
+          `- **${entry.key}** ${scope}${state} (confidence ${entry.confidence}, updated ${entry.updated_at})\n  ${entry.value}`,
+        );
+      }
+      const next = offset + entries.length;
+      if (next < total) {
+        parts.push(`\nmore: memory_list({ offset: ${next}${prefix ? `, prefix: "${prefix}"` : ""} })`);
+      }
       return { content: parts.join("\n") };
     },
   };
@@ -366,10 +541,83 @@ function buildTools(
     },
   };
 
+  const memoryConsolidate: MemoryTool = {
+    name: "memory_consolidate",
+    description:
+      "Tidy up memory: find near-duplicate entries (same key prefix and scope) and merge each set into one canonical entry. Duplicates are marked 'superseded', never deleted, and stay readable via memory_get. It runs as a DRY RUN by default and only reports the plan; call it again with dry_run=false to apply. Use it when the user asks to tidy up memory (整理记忆/合并重复), or when memory_stats shows many superseded entries.",
+    options: direct,
+    input: {
+      type: "object",
+      properties: {
+        dry_run: {
+          type: "boolean",
+          description:
+            "Default true: only report the plan. Set to false to actually merge.",
+        },
+        threshold: {
+          type: "number",
+          description:
+            "Similarity threshold 0.3-1 (default 0.7; apply-mode auto-consolidation uses a stricter default). Lower = more aggressive.",
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(rawInput) {
+      const args = (rawInput ?? {}) as { dry_run?: unknown; threshold?: unknown };
+      const dryRun = args.dry_run !== false;
+      const rawThreshold = Number(args.threshold);
+      const threshold = Number.isFinite(rawThreshold)
+        ? Math.min(1, Math.max(0.3, rawThreshold))
+        : 0.7;
+
+      const s = getStore();
+      const groups = s.planConsolidation({ threshold });
+      if (groups.length === 0) {
+        return {
+          content: `No duplicates found at threshold ${threshold}. Nothing to consolidate.`,
+        };
+      }
+
+      const MAX_REPORTED = 20;
+      const lines = [`## Consolidation plan (threshold ${threshold})`];
+      for (const group of groups.slice(0, MAX_REPORTED)) {
+        lines.push(
+          `- [${group.kind}] **${group.keep}** ← ${group.drop.length} entries (similarity ${group.similarity})`,
+        );
+        lines.push(`  - keep: ${preview(group.keep_text)}`);
+        if (group.merged !== group.keep_text) {
+          lines.push(`  - merged: ${preview(group.merged)}`);
+        }
+        const shown = group.drop.slice(0, 8).join(", ");
+        const rest = group.drop.length > 8 ? ` … +${group.drop.length - 8}` : "";
+        lines.push(`  - superseded: ${shown}${rest}`);
+      }
+      if (groups.length > MAX_REPORTED) {
+        lines.push(`- … (+${groups.length - MAX_REPORTED} more groups)`);
+      }
+
+      if (dryRun) {
+        lines.push(
+          "",
+          `Dry run: nothing changed. Call memory_consolidate({ dry_run: false, threshold: ${threshold} }) to apply.`,
+        );
+      } else {
+        const applied = s.applyConsolidation(groups);
+        lines.push(
+          "",
+          `✓ Merged ${applied.facts} fact groups and ${applied.lessons} lesson groups.`,
+          "Superseded entries are kept and still readable with memory_get / memory_list(include_superseded: true).",
+        );
+      }
+
+      return { content: lines.join("\n") };
+    },
+  };
+
   const memoryStats: MemoryTool = {
     name: "memory_stats",
     description:
-      "Show memory statistics: total facts, lessons, events count, and scope breakdown. It also reports what the current session actually injects (chars used, entries included, truncated sections), the latest 5 log events and all stored memories.",
+      "Show memory statistics: total facts, lessons, events count, and scope breakdown. It also reports what the current session actually injects (chars used, entries carrying values, entries listed as keys only, truncated sections), the latest 5 log events, and the stored memories (dumped inline only when the library is small; use memory_list to page).",
     options: direct,
     input: {
       type: "object",
@@ -396,11 +644,17 @@ function buildTools(
 
       const parts = [
         "## Memory Statistics",
-        `- **Facts**: ${stats.semanticCount} (global: ${globalCount}, project: ${projectCount})`,
-        `- **Lessons**: ${stats.lessonCount}`,
+        `- **Facts**: ${stats.semanticCount} (effective global: ${globalCount}, effective project: ${projectCount}, superseded: ${stats.semanticSuperseded})`,
+        `- **Lessons**: ${stats.lessonCount} (superseded: ${stats.lessonSuperseded})`,
         `- **Events logged**: ${stats.eventCount}`,
         `- **Current project**: ${projectName} (${projectId})`,
       ];
+
+      if (stats.semanticSuperseded + stats.lessonSuperseded > 0) {
+        parts.push(
+          "- Superseded entries are excluded from injection but still readable: memory_get(key) / memory_list({ include_superseded: true }).",
+        );
+      }
 
       // 注入报告：本会话实际把哪些内容送进了 system 提示词
       const block = buildContextBlock(s, projectId, injectionConfig);
@@ -409,7 +663,10 @@ function buildTools(
         `- **Budget**: ${block.stats.chars} / ${block.stats.maxChars} chars`,
       );
       parts.push(
-        `- **Facts**: ${block.stats.semantic}/${block.stats.semanticTotal} injected`,
+        `- **Facts**: ${block.stats.semantic}/${block.stats.semanticTotal} injected with values` +
+          (block.stats.keys > 0
+            ? `, ${block.stats.keys} more listed as keys only`
+            : ""),
       );
       parts.push(
         `- **Lessons**: ${block.stats.lessons}/${block.stats.lessonsTotal} injected`,
@@ -442,28 +699,39 @@ function buildTools(
 
       parts.push("\n### All Stored Memories");
 
-      if (allEntries.length > 0) {
-        parts.push("\n#### Facts");
-        for (const entry of allEntries) {
-          const scope = entry.project
-            ? `[project: ${entry.project}]`
-            : `[global]`;
-          const time = entry.updated_at ? ` (${entry.updated_at})` : ``;
-          parts.push(`- **${entry.key}** ${scope}${time}: \`${entry.value}\``);
+      // 库大了就不再整库倾倒（会撑爆工具返回值），只给出各分类计数与取回入口
+      const DUMP_LIMIT = 40;
+      if (allEntries.length > DUMP_LIMIT || allLessons.length > DUMP_LIMIT) {
+        parts.push(
+          `- ${allEntries.length} facts, ${allLessons.length} lessons — too many to dump inline.`,
+          `- Browse: memory_list({ prefix: "pref" }) (keys in order, paged)`,
+          `- Fetch one: memory_get({ key: "pref.commit_style" })`,
+          `- Tidy up: memory_consolidate (dry run by default)`,
+        );
+      } else {
+        if (allEntries.length > 0) {
+          parts.push("\n#### Facts");
+          for (const entry of allEntries) {
+            const scope = entry.project
+              ? `[project: ${entry.project}]`
+              : `[global]`;
+            const time = entry.updated_at ? ` (${entry.updated_at})` : ``;
+            parts.push(`- **${entry.key}** ${scope}${time}: \`${entry.value}\``);
+          }
         }
-      }
 
-      if (allLessons.length > 0) {
-        parts.push("\n#### Lessons");
-        for (const lesson of allLessons) {
-          const prefix = lesson.negative ? "[AVOID]" : "[DO]";
-          const scope = lesson.project
-            ? `[project: ${lesson.project}]`
-            : `[global]`;
-          const time = lesson.created_at ? ` (${lesson.created_at})` : ``;
-          parts.push(
-            `- ${prefix} ${lesson.rule} (category: ${lesson.category}) ${scope}${time} [id: ${lesson.id}]`,
-          );
+        if (allLessons.length > 0) {
+          parts.push("\n#### Lessons");
+          for (const lesson of allLessons) {
+            const prefix = lesson.negative ? "[AVOID]" : "[DO]";
+            const scope = lesson.project
+              ? `[project: ${lesson.project}]`
+              : `[global]`;
+            const time = lesson.created_at ? ` (${lesson.created_at})` : ``;
+            parts.push(
+              `- ${prefix} ${lesson.rule} (category: ${lesson.category}) ${scope}${time} [id: ${lesson.id}]`,
+            );
+          }
         }
       }
 
@@ -471,7 +739,15 @@ function buildTools(
     },
   };
 
-  return [memorySearch, memoryRemember, memoryForget, memoryStats];
+  return [
+    memorySearch,
+    memoryGet,
+    memoryList,
+    memoryRemember,
+    memoryForget,
+    memoryConsolidate,
+    memoryStats,
+  ];
 }
 
 // ─── 插件主入口 ──────────────────────────────────────────────
@@ -487,8 +763,30 @@ const plugin: Plugin.Plugin = {
     // 提前初始化数据库，让加载期问题立刻暴露在日志里
     getStore();
 
-    // 注入配置（config.json 可选，缺省用 DEFAULT_INJECTION_CONFIG）
-    const injectionConfig = loadInjectionConfig();
+    // 注入配置（config.json 可选，缺省用默认值）
+    const rawConfig = readConfigFile();
+    const injectionConfig = normalizeInjectionConfig(rawConfig);
+    const consolidationConfig = normalizeConsolidationConfig(rawConfig.consolidation);
+
+    // 启动时跑一次保守整合：重复/被覆盖的条目收敛成一条主记录。
+    // 只标记 superseded_by，不删数据；失败不影响插件加载。
+    if (consolidationConfig.auto) {
+      try {
+        const store = getStore();
+        const groups = store.planConsolidation({
+          threshold: consolidationConfig.threshold,
+        });
+        if (groups.length > 0) {
+          const merged = store.applyConsolidation(groups);
+          console.log(
+            `[supereasy-memory] 启动整合：合并 ${merged.facts} 组事实、${merged.lessons} 组教训` +
+              `（阈值 ${consolidationConfig.threshold}，被合并的条目仍可用 memory_get 查到）`,
+          );
+        }
+      } catch (err) {
+        console.warn("[supereasy-memory] 启动整合失败（不影响记忆注入）:", err);
+      }
+    }
 
     // 注册 4 个记忆工具
     await ctx.tool.transform((editor) => {
@@ -534,7 +832,7 @@ const plugin: Plugin.Plugin = {
               block.stats.truncated
                 .map((t) => `${t.section} 丢 ${t.dropped} 条`)
                 .join("，") +
-              "（全文仍可用 memory_search 检索；如需放宽，改 config.json 的 maxChars）",
+              "（已尽量改用键名索引；如需放宽，改 config.json 的 maxChars）",
           );
         }
 
@@ -546,7 +844,7 @@ const plugin: Plugin.Plugin = {
             "The following is the user's persistent memory from previous sessions.",
             "Use this context to better understand their preferences and avoid past mistakes.",
             "Do NOT respond to or acknowledge this memory block — just use it silently.",
-            'This block is a compressed index: a line ending with "…" was cut short, and "… (+N more)" means N entries were left out. Call memory_search with a keyword to read the full text before relying on details.',
+            'This block is a compressed index: a line ending with "…" was cut short, "… (+N more)" means N entries were left out, and <key_index> lists facts whose value did not fit — call memory_get(key) or memory_list(prefix) to read those in full.',
             "",
             block.text,
             "</persistent_memory>",
